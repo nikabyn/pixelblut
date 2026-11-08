@@ -5,16 +5,19 @@ use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
 use std::thread::{self, park};
 
-const WIDTH: usize = 1920;
-const HEIGHT: usize = 1080;
+// const ADDR: &str = "10.42.0.1:1234";
+const ADDR: &str = "0.0.0.0:1234";
+
+const WIDTH: usize = 960;
+const HEIGHT: usize = 480;
 const PIXEL_SIZE: usize = 3;
 static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
 
-const NUM_SEND_THREADS: usize = 2;
-const NUM_GEN_THREADS: usize = 2;
+const NUM_SEND_THREADS: usize = 480 / 16;
+const NUM_GEN_THREADS: usize = 1;
 
 fn main() -> std::io::Result<()> {
-    let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
+    let stream = TcpStream::connect(ADDR).unwrap();
     let mut clear = PixelflutStream::new(stream, WIDTH as u16, HEIGHT as u16);
     for y in 0..HEIGHT {
         clear.write_rgb_row(y as u16, &[0_u8; WIDTH * PIXEL_SIZE]);
@@ -45,12 +48,12 @@ fn main() -> std::io::Result<()> {
 
 #[inline(never)]
 fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
-    eprintln!("worker {} connected", chunk.index);
+    // eprintln!("worker {} connected", chunk.index);
 
-    let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
-    let min_x: u16 = 0;
+    let stream = TcpStream::connect(ADDR).unwrap();
+    let min_x: u16 = (WIDTH / 2) as u16;
     let min_y: u16 = chunk.rows_start as u16;
-    let max_x: u16 = WIDTH as u16;
+    let max_x: u16 = (WIDTH / 2) as u16 + WIDTH as u16;
     let max_y: u16 = chunk.rows_end as u16;
 
     let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
@@ -74,10 +77,12 @@ fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
         let rows_start = chunk.rows_start;
 
         let t = (i % 300) as f32 / 300.0;
-        let box_center_x = WIDTH / 2;
-        let box_center_y = (HEIGHT as i32 / 2 - (500.0 * (t * 2.0 - 1.0)) as i32) as usize;
-        let box_width = 200;
-        let box_height = 200;
+        let box_center_x =
+            (WIDTH as i32 / 2 + ((WIDTH / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
+        let box_center_y =
+            (HEIGHT as i32 / 2 - ((HEIGHT / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
+        let box_width = 20;
+        let box_height = 20;
         let box_x = (box_center_x - box_width / 2)..(box_center_x + box_width / 2);
         let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
 
