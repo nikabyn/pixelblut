@@ -44,6 +44,7 @@
         rustfmt
         clippy
         rust-analyzer
+        perf
 
         pkg-config
       ];
