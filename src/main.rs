@@ -4,23 +4,37 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
 use std::thread::{self, park};
+use std::time::Instant;
 
+// Wifi
 // const ADDR: &str = "10.42.0.1:1234";
-const ADDR: &str = "0.0.0.0:1234";
+// const WIDTH: usize = 960;
+// const HEIGHT: usize = 480;
+// const NUM_SEND_THREADS: usize = 480 / 8;
+// const NUM_GEN_THREADS: usize = 4;
 
-const WIDTH: usize = 960;
-const HEIGHT: usize = 480;
+// Ethernet direct
+const ADDR: &str = "10.10.10.2:1234";
+const WIDTH: usize = 1920;
+const HEIGHT: usize = 1080;
+const NUM_SEND_THREADS: usize = 135;
+const NUM_GEN_THREADS: usize = 4;
+
+// local
+// const ADDR: &str = "0.0.0.0:1234";
+// const WIDTH: usize = 1920;
+// const HEIGHT: usize = 1080;
+// const NUM_SEND_THREADS: usize = 8;
+// const NUM_GEN_THREADS: usize = 8;
+
 const PIXEL_SIZE: usize = 3;
 static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
 
-const NUM_SEND_THREADS: usize = 480 / 16;
-const NUM_GEN_THREADS: usize = 1;
-
 fn main() -> std::io::Result<()> {
     let stream = TcpStream::connect(ADDR).unwrap();
-    let mut clear = PixelflutStream::new(stream, WIDTH as u16, HEIGHT as u16);
-    for y in 0..HEIGHT {
-        clear.write_rgb_row(y as u16, &[0_u8; WIDTH * PIXEL_SIZE]);
+    let mut clear = PixelflutStream::new(stream, 1920, 1080);
+    for y in 0..1080 {
+        clear.write_rgb_row(y as u16, &[0_u8; 1920 * PIXEL_SIZE]);
     }
     clear.flush().unwrap();
     drop(clear);
@@ -51,9 +65,9 @@ fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     // eprintln!("worker {} connected", chunk.index);
 
     let stream = TcpStream::connect(ADDR).unwrap();
-    let min_x: u16 = (WIDTH / 2) as u16;
+    let min_x: u16 = 0;
     let min_y: u16 = chunk.rows_start as u16;
-    let max_x: u16 = (WIDTH / 2) as u16 + WIDTH as u16;
+    let max_x: u16 = WIDTH as u16;
     let max_y: u16 = chunk.rows_end as u16;
 
     let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
@@ -71,12 +85,16 @@ fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
 
 #[inline(never)]
 fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
-    for i in 0.. {
-        barrier.wait();
-        // eprintln!("starting generation");
-        let rows_start = chunk.rows_start;
+    let start = Instant::now();
 
-        let t = (i % 300) as f32 / 300.0;
+    loop {
+        barrier.wait();
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(start).as_secs_f32();
+        let t = (elapsed % 1.0) / 1.0;
+
+        let rows_start = chunk.rows_start;
         let box_center_x =
             (WIDTH as i32 / 2 + ((WIDTH / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
         let box_center_y =
@@ -290,13 +308,4 @@ fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
     buffer[3] = chars[(g % 16) as usize];
     buffer[4] = chars[(b / 16) as usize];
     buffer[5] = chars[(b % 16) as usize];
-}
-
-fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
-    let start = (x + WIDTH * y) * PIXEL_SIZE;
-    let [r, g, b] = rgb;
-
-    pixels[start] = r;
-    pixels[start + 1] = g;
-    pixels[start + 2] = b;
 }
