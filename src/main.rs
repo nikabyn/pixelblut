@@ -2,88 +2,118 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::thread::{self, sleep};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
-const WIDTH: usize = 1280;
-const HEIGHT: usize = 720;
+const WIDTH: usize = 1920;
+const HEIGHT: usize = 1080;
 const PIXEL_SIZE: usize = 3;
-const PIXEL_BUFFER_SIZE: usize = PIXEL_SIZE * WIDTH * HEIGHT;
-static mut PIXEL_BUFFER: [u8; PIXEL_BUFFER_SIZE] = [0; _];
+static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
 
-const NUM_THREADS: usize = 24;
+const NUM_SEND_THREADS: usize = 4;
+const NUM_GEN_THREADS: usize = 8;
 
 fn main() -> std::io::Result<()> {
-    let colors = [
-        [255, 0, 0],
-        [0, 255, 0],
-        [0, 0, 255],
-        [255, 255, 0],
-        [255, 0, 255],
-        [0, 255, 255],
-    ];
-
-    let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
+    let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
     let mut clear = PixelflutStream::new(stream, WIDTH as u16, HEIGHT as u16);
-    for x in 0..WIDTH {
-        for y in 0..HEIGHT {
-            clear.write_px_rgb(x as u16, y as u16, [0, 0, 0]);
-        }
-        clear.flush().unwrap();
+    for y in 0..HEIGHT {
+        clear.write_rgb_row(y as u16, &[0_u8; WIDTH * PIXEL_SIZE]);
     }
+    clear.flush().unwrap();
     drop(clear);
 
-    for mut chunk in chunks(NUM_THREADS) {
-        thread::spawn(move || {
-            let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
-            let min_x: u16 = 0;
-            let min_y: u16 = chunk.rows_start as u16;
-            let max_x: u16 = WIDTH as u16;
-            let max_y: u16 = chunk.rows_end as u16;
-
-            let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
-            stream.offset(min_x, min_y).unwrap();
-
-            let color = colors[chunk.index % colors.len()];
-
-            for i in 0.. {
-                for (row_index, row) in chunk.rows().enumerate() {
-                    let y = row_index;
-                    for (x, rgb) in unsafe { row.as_chunks_unchecked::<PIXEL_SIZE>() }
-                        .iter()
-                        .enumerate()
-                    {
-                        stream.write_px_rgb(
-                            x as u16,
-                            y as u16,
-                            if i % 2 == 0 { color } else { *rgb },
-                            // color,
-                            // *rgb,
-                        );
-                    }
-                }
-                stream.flush().unwrap();
-            }
+    for chunk in chunks(NUM_SEND_THREADS) {
+        thread::spawn(|| {
+            send_pixels_worker(chunk);
         });
     }
 
-    sleep(Duration::from_hours(1));
-    let mut i: usize = 0;
+    let thread_states: Box<[Arc<AtomicBool>]> =
+        std::iter::repeat_with(|| Arc::new(AtomicBool::new(false)))
+            .take(NUM_GEN_THREADS)
+            .collect();
+
+    for (chunk, thread_state) in chunks(NUM_GEN_THREADS).zip(&thread_states) {
+        let thread_state = thread_state.clone();
+        thread::spawn(|| {
+            generate_pixels_worker(chunk, thread_state);
+        });
+    }
+
     loop {
-        i = i.wrapping_add(1);
-        let t = (i % 1000) as f32 / 1000.0;
+        let mut all_finished = true;
+        for thread_state in &thread_states {
+            all_finished &= thread_state.load(Ordering::Relaxed);
+        }
 
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                let u = (x as f32 / WIDTH as f32 * 255.0) as u8;
-                let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
-
-                let r = (u as f32 * t) as u8;
-                let g = (v as f32 * t) as u8;
-
-                set_pixel(unsafe { &mut PIXEL_BUFFER }, x, y, [r, g, 0]);
+        if all_finished {
+            // eprintln!("all_finished = {all_finished}");
+            for thread_state in &thread_states {
+                thread_state.store(false, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[inline(never)]
+fn send_pixels_worker(mut chunk: Chunk<'_> /* state: Arc<AtomicBool> */) {
+    eprintln!("worker {} connected", chunk.index);
+
+    let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
+    let min_x: u16 = 0;
+    let min_y: u16 = chunk.rows_start as u16;
+    let max_x: u16 = WIDTH as u16;
+    let max_y: u16 = chunk.rows_end as u16;
+
+    let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
+    stream.offset(min_x, min_y).unwrap();
+
+    loop {
+        for (y, row) in chunk.rows().enumerate() {
+            stream.write_rgb_row(y as u16, row);
+        }
+        stream.flush().unwrap();
+    }
+}
+
+#[inline(never)]
+fn generate_pixels_worker(mut chunk: Chunk<'_>, state: Arc<AtomicBool>) {
+    for i in 0.. {
+        while state.load(Ordering::Relaxed) {}
+        // eprintln!("starting generation");
+        let rows_start = chunk.rows_start;
+
+        let t = (i % 300) as f32 / 300.0;
+        let box_center_x = WIDTH / 2;
+        let box_center_y = (HEIGHT as i32 / 2 - (500.0 * (t * 2.0 - 1.0)) as i32) as usize;
+        let box_width = 200;
+        let box_height = 200;
+        let box_x = (box_center_x - box_width / 2)..(box_center_x + box_width / 2);
+        let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
+
+        for (row_index, row) in chunk.rows().enumerate() {
+            let y = row_index + rows_start;
+            let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
+            for (x, rgb) in unsafe { row.as_chunks_unchecked_mut::<3>() }
+                .iter_mut()
+                .enumerate()
+            {
+                let [r, g, b] = rgb;
+                let u = (x as f32 / WIDTH as f32 * 255.0) as u8;
+                *r = (u as f32 * t) as u8;
+                *g = (v as f32 * t) as u8;
+                *b = 0;
+
+                if box_x.contains(&x) && box_y.contains(&y) {
+                    *r = 0xff;
+                    *g = 0xff;
+                    *b = 0xff;
+                }
+            }
+        }
+
+        state.store(true, Ordering::Relaxed);
     }
 }
 
@@ -119,9 +149,8 @@ impl<'a> Chunk<'a> {
 
 struct PixelflutStream {
     inner: TcpStream,
-    buffer: Box<[u8]>,
-    buffer_len: usize,
-    px_rgb_cache: Box<[PxRgbTemplate]>,
+    cache: Box<[u8]>,
+    rgb_offsets: Box<[usize]>,
     offset_x: u16,
     offset_y: u16,
     width: u16,
@@ -133,24 +162,40 @@ impl PixelflutStream {
     fn new(inner: TcpStream, width: u16, height: u16) -> Self {
         // inner.set_nodelay(true).unwrap();
 
-        let buffer_size =
-            height as usize * width as usize * size_of_val(b"PX xxxxx yyyyy ffffff\n");
-        let buffer = unsafe { Box::new_zeroed_slice(buffer_size).assume_init() };
+        let mut cache = Vec::with_capacity(
+            width as usize * height as usize * size_of_val(b"PX xxxxx yyyyy ffffff\n"),
+        );
+        let mut rgb_offsets = Vec::with_capacity(width as usize * height as usize);
 
-        let mut px_rgb_cache = Box::new_uninit_slice(width as usize * height as usize);
         for y in 0..height {
             for x in 0..width {
-                let key = Self::pixel_key(x, y, width);
-                px_rgb_cache[key].write(PxRgbTemplate::new(x, y));
+                cache.extend_from_slice(b"PX ");
+
+                let mut x_buffer = [0; 5];
+                let x_len = encode_u16(x, &mut x_buffer);
+                cache.extend_from_slice(&x_buffer[5 - x_len..]);
+
+                cache.push(b' ');
+
+                let mut y_buffer = [0; 5];
+                let y_len = encode_u16(y, &mut y_buffer);
+                cache.extend_from_slice(&y_buffer[5 - y_len..]);
+
+                cache.push(b' ');
+
+                // Skip rgb hex section
+                rgb_offsets.push(cache.len());
+                cache.extend_from_slice(b"ffffff");
+
+                cache.push(b'\n');
             }
         }
-        let px_rgb_cache = unsafe { px_rgb_cache.assume_init() };
 
+        cache.shrink_to_fit();
         Self {
             inner,
-            buffer,
-            buffer_len: 0,
-            px_rgb_cache,
+            cache: cache.into_boxed_slice(),
+            rgb_offsets: rgb_offsets.into_boxed_slice(),
             offset_x: 0,
             offset_y: 0,
             width,
@@ -163,30 +208,49 @@ impl PixelflutStream {
     }
 
     #[inline(never)]
-    fn write_px_rgb(&mut self, x: u16, y: u16, rgb: [u8; 3]) {
-        let key = Self::pixel_key(x, y, self.width);
-        let template = &unsafe { self.px_rgb_cache.get_unchecked(key) };
-        let len = template.len as usize;
+    fn write_rgb_row(&mut self, y: u16, row: &[u8]) {
+        static HEX_U8: [u16; 256] = {
+            let mut table = [0; 256];
+            let chars = b"0123456789abcdef";
 
-        let start = self.buffer_len;
-        let end = start + len;
-        let out = &mut self.buffer[start..end];
+            let mut i = 0;
+            while i < 256 {
+                table[i] = u16::from_le_bytes([chars[i / 16], chars[i % 16]]);
+                i += 1;
+            }
 
-        out.copy_from_slice(unsafe { template.bytes.get_unchecked(..len) });
+            table
+        };
 
-        let offset = template.rgb_offset as usize;
-        static CHARS: &[u8; 16] = b"0123456789abcdef";
-        let [r, g, b] = rgb;
-        unsafe {
-            *out.get_unchecked_mut(offset + 0) = CHARS[(r / 16) as usize];
-            *out.get_unchecked_mut(offset + 1) = CHARS[(r % 16) as usize];
-            *out.get_unchecked_mut(offset + 2) = CHARS[(g / 16) as usize];
-            *out.get_unchecked_mut(offset + 3) = CHARS[(g % 16) as usize];
-            *out.get_unchecked_mut(offset + 4) = CHARS[(b / 16) as usize];
-            *out.get_unchecked_mut(offset + 5) = CHARS[(b % 16) as usize];
+        let start_key = Self::pixel_key(0, y, self.width);
+
+        let mut offset = unsafe { *self.rgb_offsets.get_unchecked(start_key) };
+        let mut stride = size_of_val(b"PX   ffffff\n").wrapping_add(digits_u16(y)) + 1;
+        let mut next_boundary = 9;
+
+        for (x, [r, g, b]) in unsafe { row.as_chunks_unchecked::<3>() }.iter().enumerate() {
+            let inc_stride = x == next_boundary;
+            next_boundary = if inc_stride {
+                next_boundary * 10 + 9
+            } else {
+                next_boundary
+            };
+            stride = stride.wrapping_add(1 * inc_stride as usize);
+
+            let r = HEX_U8[*r as usize];
+            let g = HEX_U8[*g as usize];
+            let b = HEX_U8[*b as usize];
+
+            unsafe {
+                let dst = self.cache.as_mut_ptr().add(offset).cast::<u16>();
+
+                dst.write_unaligned(r);
+                dst.add(1).write_unaligned(g);
+                dst.add(2).write_unaligned(b);
+            }
+
+            offset = offset.wrapping_add(stride);
         }
-
-        self.buffer_len += len;
     }
 
     fn offset(&mut self, offset_x: u16, offset_y: u16) -> io::Result<()> {
@@ -198,63 +262,8 @@ impl PixelflutStream {
 
     #[inline(never)]
     fn flush(&mut self) -> io::Result<()> {
-        // eprintln!("{}", String::from_utf8_lossy(&self.buffer));
-        while let Err(err) = self.inner.write_all(&self.buffer[..self.buffer_len]) {
-            if err.kind() != io::ErrorKind::WouldBlock {
-                return Err(err);
-            }
-        }
-        self.buffer_len = 0;
-        Ok(())
-    }
-}
-
-struct PxRgbTemplate {
-    bytes: [u8; 3 + 5 + 1 + 5 + 1 + 6 + 1],
-    len: u8,
-    rgb_offset: u8,
-}
-
-impl PxRgbTemplate {
-    fn new(x: u16, y: u16) -> Self {
-        let mut x_buffer = [0; 5];
-        let x_len = encode_u16(x, &mut x_buffer);
-        let x = &x_buffer[5 - x_len..];
-
-        let mut y_buffer = [0; 5];
-        let y_len = encode_u16(y, &mut y_buffer);
-        let y = &y_buffer[5 - y_len..];
-
-        let mut bytes = [0; _];
-        let mut pos = 0;
-
-        bytes[pos..pos + 3].copy_from_slice(b"PX ");
-        pos += 3;
-
-        bytes[pos..pos + x.len()].copy_from_slice(x);
-        pos += x.len();
-
-        bytes[pos] = b' ';
-        pos += 1;
-
-        bytes[pos..pos + y.len()].copy_from_slice(y);
-        pos += y.len();
-
-        bytes[pos] = b' ';
-        pos += 1;
-
-        // Skip rgb hex section
-        let rgb_offset = pos;
-        pos += 6;
-
-        bytes[pos] = b'\n';
-        pos += 1;
-
-        Self {
-            bytes,
-            len: pos as u8,
-            rgb_offset: rgb_offset as u8,
-        }
+        // eprintln!("{}", String::from_utf8_lossy(&self.cache));
+        self.inner.write_all(&self.cache)
     }
 }
 
@@ -265,6 +274,11 @@ fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
     buffer[3] = b'0' + (value / 10 % 10) as u8;
     buffer[4] = b'0' + (value / 1 % 10) as u8;
 
+    digits_u16(value)
+}
+
+#[inline]
+fn digits_u16(value: u16) -> usize {
     match value {
         ..=9 => 1,
         10..=99 => 2,
