@@ -106,22 +106,9 @@ struct EncodedU16 {
 }
 
 impl EncodedU16 {
-    fn new(mut value: u16) -> Self {
+    fn new(value: u16) -> Self {
         let mut bytes = [b' '; 5];
-        let mut len = 0;
-
-        loop {
-            bytes[len] = b'0' + (value % 10) as u8;
-            len += 1;
-            value /= 10;
-
-            if value == 0 {
-                break;
-            }
-        }
-
-        bytes[..len].reverse();
-
+        let len = encode_u16(value, &mut bytes);
         Self {
             bytes,
             len: len as u8,
@@ -139,6 +126,7 @@ struct PixelflutStream {
     buffer: [u8; Self::BUFFER_SIZE],
     buffer_len: usize,
     u16_cache: Box<[EncodedU16; 65536]>,
+    prefix_cache: Box<[(); 0]>,
 }
 
 impl PixelflutStream {
@@ -162,6 +150,7 @@ impl PixelflutStream {
                     Box::from_raw(ptr.cast::<[EncodedU16; _]>())
                 }
             },
+            prefix_cache: Box::new([]),
         }
     }
 
@@ -225,6 +214,24 @@ fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
     buffer[3] = chars[(g % 16) as usize];
     buffer[4] = chars[(b / 16) as usize];
     buffer[5] = chars[(b % 16) as usize];
+}
+
+fn encode_u16(mut value: u16, buffer: &mut [u8; 5]) -> usize {
+    let mut len = 0;
+
+    loop {
+        buffer[len] = b'0' + (value % 10) as u8;
+        len += 1;
+        value /= 10;
+
+        if value == 0 {
+            break;
+        }
+    }
+
+    buffer[..len].reverse();
+
+    len
 }
 
 fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
