@@ -1,5 +1,3 @@
-#![allow(static_mut_refs)]
-
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
@@ -17,8 +15,8 @@ use std::time::Instant;
 const ADDR: &str = "10.10.10.2:1234";
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
-const NUM_SEND_THREADS: usize = 108;
-const NUM_GEN_THREADS: usize = 4;
+const NUM_SEND_THREADS: usize = 324;
+const NUM_GEN_THREADS: usize = 8;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
@@ -39,16 +37,22 @@ fn main() -> std::io::Result<()> {
     clear.flush().unwrap();
     drop(clear);
 
+    let chunks_x = NUM_SEND_THREADS.isqrt();
+    let chunks_y = NUM_SEND_THREADS.div_ceil(chunks_x);
+
     let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_SEND_THREADS));
-    for chunk in chunks(NUM_SEND_THREADS) {
+    for chunk in chunks(chunks_x, chunks_y) {
         let send_barrier = send_barrier.clone();
         thread::spawn(|| {
             send_pixels_worker(chunk, send_barrier);
         });
     }
 
+    let chunks_x = NUM_GEN_THREADS.isqrt();
+    let chunks_y = NUM_GEN_THREADS.div_ceil(chunks_x);
+
     let generate_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_GEN_THREADS));
-    for chunk in chunks(NUM_GEN_THREADS) {
+    for chunk in chunks(chunks_x, chunks_y) {
         let generate_barrier = generate_barrier.clone();
         thread::spawn(|| {
             generate_pixels_worker(chunk, generate_barrier);
@@ -61,14 +65,14 @@ fn main() -> std::io::Result<()> {
 }
 
 // #[inline(never)]
-fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
+fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
     // eprintln!("worker {} connected", chunk.index);
 
     let stream = TcpStream::connect(ADDR).unwrap();
-    let min_x: u16 = 0;
-    let min_y: u16 = chunk.rows_start as u16;
-    let max_x: u16 = WIDTH as u16;
-    let max_y: u16 = chunk.rows_end as u16;
+    let min_x: u16 = chunk.offset_x as u16;
+    let min_y: u16 = chunk.offset_y as u16;
+    let max_x: u16 = min_x + chunk.width as u16;
+    let max_y: u16 = min_y + chunk.height as u16;
 
     let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
     stream.offset(min_x, min_y).unwrap();
@@ -84,7 +88,7 @@ fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
 }
 
 // #[inline(never)]
-fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
+fn generate_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
     let start = Instant::now();
 
     loop {
@@ -92,25 +96,29 @@ fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
 
         let now = Instant::now();
         let elapsed = now.duration_since(start).as_secs_f32();
-        let t = (elapsed % 1.0) / 1.0;
+        let t = (elapsed % 5.0) / 5.0;
 
-        let rows_start = chunk.rows_start;
+        let offset_x = chunk.offset_x;
+        let offset_y = chunk.offset_y;
+
         let box_center_x =
             (WIDTH as i32 / 2 + ((WIDTH / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
         let box_center_y =
             (HEIGHT as i32 / 2 - ((HEIGHT / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
-        let box_width = 20;
-        let box_height = 20;
+        let box_width = 200;
+        let box_height = 200;
         let box_x = (box_center_x - box_width / 2)..(box_center_x + box_width / 2);
         let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
 
         for (row_index, row) in chunk.rows().enumerate() {
-            let y = row_index + rows_start;
+            let y = row_index + offset_y;
             let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
-            for (x, rgb) in unsafe { row.as_chunks_unchecked_mut::<3>() }
+            for (local_x, rgb) in unsafe { row.as_chunks_unchecked_mut::<3>() }
                 .iter_mut()
                 .enumerate()
             {
+                let x = local_x + offset_x;
+
                 let [r, g, b] = rgb;
                 let u = (x as f32 / WIDTH as f32 * 255.0) as u8;
                 *r = (u as f32 * t) as u8;
@@ -127,35 +135,56 @@ fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     }
 }
 
-fn chunks(num_chunks: usize) -> impl Iterator<Item = Chunk<'static>> {
-    let num_rows = HEIGHT / num_chunks;
-    let row_size = WIDTH * PIXEL_SIZE;
-    let chunk_size = row_size * num_rows;
+fn chunks(chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
+    let base = (&raw mut PIXEL_BUFFER).cast::<u8>();
 
-    (0..num_chunks).map(move |index| {
-        let start_row = index * num_rows;
-        let start_byte = start_row * row_size;
-        Chunk {
-            index,
-            pixels: unsafe { &mut PIXEL_BUFFER[start_byte..start_byte + chunk_size] },
-            rows_start: start_row,
-            rows_end: start_row + num_rows,
-        }
-    })
+    (0..chunks_x)
+        .flat_map(move |x| (0..chunks_y).map(move |y| (x, y)))
+        .map(move |(index_x, index_y)| {
+            let offset_x = index_x * WIDTH / chunks_x;
+            let offset_y = index_y * HEIGHT / chunks_y;
+
+            let end_x = (index_x + 1) * WIDTH / chunks_x;
+            let end_y = (index_y + 1) * HEIGHT / chunks_y;
+
+            let width = end_x - offset_x;
+            let height = end_y - offset_y;
+
+            let offset = offset_y * WIDTH * PIXEL_SIZE + offset_x * PIXEL_SIZE;
+
+            Chunk {
+                pixels: unsafe { base.add(offset) },
+                offset_x,
+                offset_y,
+                width,
+                height,
+            }
+        })
 }
 
-struct Chunk<'a> {
-    index: usize,
-    pixels: &'a mut [u8],
-    rows_start: usize,
-    rows_end: usize,
+struct Chunk {
+    pixels: *mut u8,
+    offset_x: usize,
+    offset_y: usize,
+    width: usize,
+    height: usize,
 }
 
-impl<'a> Chunk<'a> {
-    fn rows(&mut self) -> impl Iterator<Item = &mut [u8]> {
-        self.pixels.chunks_exact_mut(WIDTH * PIXEL_SIZE)
+impl Chunk {
+    fn rows(&mut self) -> impl Iterator<Item = &mut [u8]> + '_ {
+        let pixels = self.pixels;
+        let width = self.width;
+        let height = self.height;
+
+        (0..height).map(move |y| unsafe {
+            std::slice::from_raw_parts_mut(pixels.add(y * WIDTH * PIXEL_SIZE), width * PIXEL_SIZE)
+        })
     }
 }
+
+// Each chunk owns a distinct rectangular region.
+// Mutable slices are only created for individual rows.
+unsafe impl Send for Chunk {}
 
 struct PixelflutStream {
     inner: TcpStream,
