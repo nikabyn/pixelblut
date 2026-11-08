@@ -1,7 +1,7 @@
 #![allow(static_mut_refs)]
 
-use std::boxed::BoxedArrayIntoIter;
-use std::io::{self, prelude::*};
+use io::Write;
+use std::io;
 use std::net::TcpStream;
 use std::thread::{self, sleep};
 use std::time::Duration;
@@ -25,7 +25,11 @@ fn main() -> std::io::Result<()> {
     for mut chunk in chunks(16) {
         thread::spawn(move || {
             let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
-            let mut stream = PixelflutStream::new(stream);
+            let min_x: u16 = 0;
+            let min_y: u16 = chunk.rows_start as u16;
+            let max_x: u16 = WIDTH as u16;
+            let max_y: u16 = chunk.rows_end as u16;
+            let mut stream = PixelflutStream::new(stream, min_x, min_y, max_x, max_y);
 
             // eprintln!("u16 cache size = {}", size_of_val(&*stream.u16_cache));
 
@@ -70,6 +74,7 @@ fn main() -> std::io::Result<()> {
         }
     }
 }
+
 fn chunks(num_chunks: usize) -> impl Iterator<Item = Chunk<'static>> {
     let num_rows = HEIGHT / num_chunks;
     let row_size = WIDTH * PIXEL_SIZE;
@@ -100,100 +105,75 @@ impl<'a> Chunk<'a> {
     }
 }
 
-struct EncodedU16 {
-    bytes: [u8; 5],
-    len: u8,
-}
-
-impl EncodedU16 {
-    fn new(value: u16) -> Self {
-        let mut bytes = [b' '; 5];
-        let len = encode_u16(value, &mut bytes);
-        Self {
-            bytes,
-            len: len as u8,
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        // SAFETY len is always in range 1..=5
-        &unsafe { self.bytes.get_unchecked(5 - self.len as usize..) }
-    }
-}
-
 struct PixelflutStream {
     inner: TcpStream,
     buffer: [u8; Self::BUFFER_SIZE],
     buffer_len: usize,
-    u16_cache: Box<[EncodedU16; 65536]>,
-    prefix_cache: Box<[(); 0]>,
+    px_rgb_cache: Box<[PxRgbTemplate]>,
+    min_x: u16,
+    min_y: u16,
+    max_x: u16,
+    max_y: u16,
 }
 
 impl PixelflutStream {
     const BUFFER_SIZE: usize = WIDTH * size_of_val(b"PX xxxxx yyyyy ffffff\n");
 
-    fn new(inner: TcpStream) -> Self {
+    #[inline(never)]
+    fn new(inner: TcpStream, min_x: u16, min_y: u16, max_x: u16, max_y: u16) -> Self {
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+
+        let mut px_rgb_cache = Box::new_uninit_slice((width as usize + 1) * (height as usize + 1));
+        for x in min_x..=max_x {
+            for y in min_y..=max_y {
+                let key = Self::pixel_key(x - min_x, y - min_y, height);
+                px_rgb_cache[key].write(PxRgbTemplate::new(x, y));
+            }
+        }
+        let px_rgb_cache = unsafe { px_rgb_cache.assume_init() };
+
         Self {
             inner,
             buffer: [0; _],
             buffer_len: 0,
-            u16_cache: {
-                let array = Box::<[EncodedU16; 65536]>::new_uninit();
-
-                unsafe {
-                    let ptr = Box::into_raw(array).cast::<EncodedU16>();
-
-                    for i in 0..=u16::MAX {
-                        ptr.add(i as usize).write(EncodedU16::new(i));
-                    }
-
-                    Box::from_raw(ptr.cast::<[EncodedU16; _]>())
-                }
-            },
-            prefix_cache: Box::new([]),
+            px_rgb_cache,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
         }
+    }
+
+    fn pixel_key(relative_x: u16, relative_y: u16, height: u16) -> usize {
+        (relative_x as usize) * (height as usize + 1) + relative_y as usize
     }
 
     #[inline(never)]
     fn write_px_rgb(&mut self, x: u16, y: u16, rgb: [u8; 3]) {
-        // SAFETY: values are u16 and must be less than 65536
-        let x = unsafe { self.u16_cache.get_unchecked(x as usize) }.as_bytes();
-        let y = unsafe { self.u16_cache.get_unchecked(y as usize) }.as_bytes();
-
-        let len =
-            size_of_val(b"PX ") + x.len() + size_of_val(b" ") + y.len() + size_of_val(" rrggbb\n");
+        let key = Self::pixel_key(x - self.min_x, y - self.min_y, self.max_y - self.min_y);
+        let template = &unsafe { self.px_rgb_cache.get_unchecked(key) };
+        let len = template.len as usize;
 
         let start = self.buffer_len;
         let end = start + len;
         let out = &mut self.buffer[start..end];
-        let mut pos = 0;
 
-        out[pos..pos + 3].copy_from_slice(b"PX ");
-        pos += 3;
+        out.copy_from_slice(unsafe { template.bytes.get_unchecked(..len) });
 
-        out[pos..pos + x.len()].copy_from_slice(x);
-        pos += x.len();
+        let offset = template.rgb_offset as usize;
+        static CHARS: &[u8; 16] = b"0123456789abcdef";
+        let [r, g, b] = rgb;
+        unsafe {
+            *out.get_unchecked_mut(offset + 0) = CHARS[(r / 16) as usize];
+            *out.get_unchecked_mut(offset + 1) = CHARS[(r % 16) as usize];
+            *out.get_unchecked_mut(offset + 2) = CHARS[(g / 16) as usize];
+            *out.get_unchecked_mut(offset + 3) = CHARS[(g % 16) as usize];
+            *out.get_unchecked_mut(offset + 4) = CHARS[(b / 16) as usize];
+            *out.get_unchecked_mut(offset + 5) = CHARS[(b % 16) as usize];
+        }
 
-        out[pos] = b' ';
-        pos += 1;
-
-        out[pos..pos + y.len()].copy_from_slice(y);
-        pos += y.len();
-
-        out[pos] = b' ';
-        pos += 1;
-
-        encode_rgb_hex(rgb, {
-            let hex_buffer = out[pos..pos + 6].as_mut_array();
-            // SAFETY slice has constant length 6
-            unsafe { hex_buffer.unwrap_unchecked() }
-        });
-        pos += 6;
-
-        out[pos] = b'\n';
-        pos += 1;
-
-        self.buffer_len += pos;
+        self.buffer_len += len;
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -204,16 +184,53 @@ impl PixelflutStream {
     }
 }
 
-fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
-    let chars = b"0123456789abcdef";
+struct PxRgbTemplate {
+    bytes: [u8; 3 + 5 + 1 + 5 + 1 + 6 + 1],
+    len: u8,
+    rgb_offset: u8,
+}
 
-    let [r, g, b] = rgb;
-    buffer[0] = chars[(r / 16) as usize];
-    buffer[1] = chars[(r % 16) as usize];
-    buffer[2] = chars[(g / 16) as usize];
-    buffer[3] = chars[(g % 16) as usize];
-    buffer[4] = chars[(b / 16) as usize];
-    buffer[5] = chars[(b % 16) as usize];
+impl PxRgbTemplate {
+    fn new(x: u16, y: u16) -> Self {
+        let mut x_buffer = [0; 5];
+        let x_len = encode_u16(x, &mut x_buffer);
+        let x = &x_buffer[5 - x_len..];
+
+        let mut y_buffer = [0; 5];
+        let y_len = encode_u16(y, &mut y_buffer);
+        let y = &y_buffer[5 - y_len..];
+
+        let mut bytes = [0; _];
+        let mut pos = 0;
+
+        bytes[pos..pos + 3].copy_from_slice(b"PX ");
+        pos += 3;
+
+        bytes[pos..pos + x.len()].copy_from_slice(x);
+        pos += x.len();
+
+        bytes[pos] = b' ';
+        pos += 1;
+
+        bytes[pos..pos + y.len()].copy_from_slice(y);
+        pos += y.len();
+
+        bytes[pos] = b' ';
+        pos += 1;
+
+        // Skip rgb hex section
+        let rgb_offset = pos;
+        pos += 6;
+
+        bytes[pos] = b'\n';
+        pos += 1;
+
+        Self {
+            bytes,
+            len: pos as u8,
+            rgb_offset: rgb_offset as u8,
+        }
+    }
 }
 
 fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
@@ -230,6 +247,18 @@ fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
         1_000..=9_999 => 4,
         10_000.. => 5,
     }
+}
+
+fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
+    let chars = b"0123456789abcdef";
+
+    let [r, g, b] = rgb;
+    buffer[0] = chars[(r / 16) as usize];
+    buffer[1] = chars[(r % 16) as usize];
+    buffer[2] = chars[(g / 16) as usize];
+    buffer[3] = chars[(g % 16) as usize];
+    buffer[4] = chars[(b / 16) as usize];
+    buffer[5] = chars[(b % 16) as usize];
 }
 
 fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
