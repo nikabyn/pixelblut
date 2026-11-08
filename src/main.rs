@@ -1,7 +1,6 @@
 #![allow(static_mut_refs)]
 
-use io::Write;
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::thread::{self, sleep};
 use std::time::Duration;
@@ -11,6 +10,8 @@ const HEIGHT: usize = 720;
 const PIXEL_SIZE: usize = 3;
 const PIXEL_BUFFER_SIZE: usize = PIXEL_SIZE * WIDTH * HEIGHT;
 static mut PIXEL_BUFFER: [u8; PIXEL_BUFFER_SIZE] = [0; _];
+
+const NUM_THREADS: usize = 24;
 
 fn main() -> std::io::Result<()> {
     let colors = [
@@ -22,22 +23,32 @@ fn main() -> std::io::Result<()> {
         [0, 255, 255],
     ];
 
-    for mut chunk in chunks(16) {
+    let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
+    let mut clear = PixelflutStream::new(stream, WIDTH as u16, HEIGHT as u16);
+    for x in 0..WIDTH {
+        for y in 0..HEIGHT {
+            clear.write_px_rgb(x as u16, y as u16, [0, 0, 0]);
+        }
+        clear.flush().unwrap();
+    }
+    drop(clear);
+
+    for mut chunk in chunks(NUM_THREADS) {
         thread::spawn(move || {
             let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
             let min_x: u16 = 0;
             let min_y: u16 = chunk.rows_start as u16;
             let max_x: u16 = WIDTH as u16;
             let max_y: u16 = chunk.rows_end as u16;
-            let mut stream = PixelflutStream::new(stream, min_x, min_y, max_x, max_y);
 
-            // eprintln!("u16 cache size = {}", size_of_val(&*stream.u16_cache));
+            let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
+            stream.offset(min_x, min_y).unwrap();
 
-            let rows_start = chunk.rows_start;
             let color = colors[chunk.index % colors.len()];
+
             for i in 0.. {
                 for (row_index, row) in chunk.rows().enumerate() {
-                    let y = row_index + rows_start;
+                    let y = row_index;
                     for (x, rgb) in unsafe { row.as_chunks_unchecked::<PIXEL_SIZE>() }
                         .iter()
                         .enumerate()
@@ -46,11 +57,12 @@ fn main() -> std::io::Result<()> {
                             x as u16,
                             y as u16,
                             if i % 2 == 0 { color } else { *rgb },
+                            // color,
+                            // *rgb,
                         );
                     }
-
-                    stream.flush().unwrap();
                 }
+                stream.flush().unwrap();
             }
         });
     }
@@ -107,27 +119,28 @@ impl<'a> Chunk<'a> {
 
 struct PixelflutStream {
     inner: TcpStream,
-    buffer: [u8; Self::BUFFER_SIZE],
+    buffer: Box<[u8]>,
     buffer_len: usize,
     px_rgb_cache: Box<[PxRgbTemplate]>,
-    min_x: u16,
-    min_y: u16,
-    max_x: u16,
-    max_y: u16,
+    offset_x: u16,
+    offset_y: u16,
+    width: u16,
+    height: u16,
 }
 
 impl PixelflutStream {
-    const BUFFER_SIZE: usize = WIDTH * size_of_val(b"PX xxxxx yyyyy ffffff\n");
-
     #[inline(never)]
-    fn new(inner: TcpStream, min_x: u16, min_y: u16, max_x: u16, max_y: u16) -> Self {
-        let width = max_x - min_x;
-        let height = max_y - min_y;
+    fn new(inner: TcpStream, width: u16, height: u16) -> Self {
+        // inner.set_nodelay(true).unwrap();
 
-        let mut px_rgb_cache = Box::new_uninit_slice((width as usize + 1) * (height as usize + 1));
-        for x in min_x..=max_x {
-            for y in min_y..=max_y {
-                let key = Self::pixel_key(x - min_x, y - min_y, height);
+        let buffer_size =
+            height as usize * width as usize * size_of_val(b"PX xxxxx yyyyy ffffff\n");
+        let buffer = unsafe { Box::new_zeroed_slice(buffer_size).assume_init() };
+
+        let mut px_rgb_cache = Box::new_uninit_slice(width as usize * height as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let key = Self::pixel_key(x, y, width);
                 px_rgb_cache[key].write(PxRgbTemplate::new(x, y));
             }
         }
@@ -135,23 +148,23 @@ impl PixelflutStream {
 
         Self {
             inner,
-            buffer: [0; _],
+            buffer,
             buffer_len: 0,
             px_rgb_cache,
-            min_x,
-            min_y,
-            max_x,
-            max_y,
+            offset_x: 0,
+            offset_y: 0,
+            width,
+            height,
         }
     }
 
-    fn pixel_key(relative_x: u16, relative_y: u16, height: u16) -> usize {
-        (relative_x as usize) * (height as usize + 1) + relative_y as usize
+    fn pixel_key(x: u16, y: u16, width: u16) -> usize {
+        y as usize * width as usize + x as usize
     }
 
     #[inline(never)]
     fn write_px_rgb(&mut self, x: u16, y: u16, rgb: [u8; 3]) {
-        let key = Self::pixel_key(x - self.min_x, y - self.min_y, self.max_y - self.min_y);
+        let key = Self::pixel_key(x, y, self.width);
         let template = &unsafe { self.px_rgb_cache.get_unchecked(key) };
         let len = template.len as usize;
 
@@ -176,9 +189,21 @@ impl PixelflutStream {
         self.buffer_len += len;
     }
 
+    fn offset(&mut self, offset_x: u16, offset_y: u16) -> io::Result<()> {
+        self.offset_x = offset_x;
+        self.offset_y = offset_y;
+        self.inner
+            .write_all(format!("OFFSET {offset_x} {offset_y}\n").as_bytes())
+    }
+
+    #[inline(never)]
     fn flush(&mut self) -> io::Result<()> {
         // eprintln!("{}", String::from_utf8_lossy(&self.buffer));
-        self.inner.write_all(&self.buffer[..self.buffer_len])?;
+        while let Err(err) = self.inner.write_all(&self.buffer[..self.buffer_len]) {
+            if err.kind() != io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+        }
         self.buffer_len = 0;
         Ok(())
     }
