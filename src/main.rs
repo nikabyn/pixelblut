@@ -2,17 +2,16 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::{Arc, Barrier};
+use std::thread::{self, park};
 
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
 const PIXEL_SIZE: usize = 3;
 static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
 
-const NUM_SEND_THREADS: usize = 4;
-const NUM_GEN_THREADS: usize = 8;
+const NUM_SEND_THREADS: usize = 2;
+const NUM_GEN_THREADS: usize = 2;
 
 fn main() -> std::io::Result<()> {
     let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
@@ -23,41 +22,29 @@ fn main() -> std::io::Result<()> {
     clear.flush().unwrap();
     drop(clear);
 
+    let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_SEND_THREADS));
     for chunk in chunks(NUM_SEND_THREADS) {
+        let send_barrier = send_barrier.clone();
         thread::spawn(|| {
-            send_pixels_worker(chunk);
+            send_pixels_worker(chunk, send_barrier);
         });
     }
 
-    let thread_states: Box<[Arc<AtomicBool>]> =
-        std::iter::repeat_with(|| Arc::new(AtomicBool::new(false)))
-            .take(NUM_GEN_THREADS)
-            .collect();
-
-    for (chunk, thread_state) in chunks(NUM_GEN_THREADS).zip(&thread_states) {
-        let thread_state = thread_state.clone();
+    let generate_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_GEN_THREADS));
+    for chunk in chunks(NUM_GEN_THREADS) {
+        let generate_barrier = generate_barrier.clone();
         thread::spawn(|| {
-            generate_pixels_worker(chunk, thread_state);
+            generate_pixels_worker(chunk, generate_barrier);
         });
     }
 
     loop {
-        let mut all_finished = true;
-        for thread_state in &thread_states {
-            all_finished &= thread_state.load(Ordering::Relaxed);
-        }
-
-        if all_finished {
-            // eprintln!("all_finished = {all_finished}");
-            for thread_state in &thread_states {
-                thread_state.store(false, Ordering::Relaxed);
-            }
-        }
+        park();
     }
 }
 
 #[inline(never)]
-fn send_pixels_worker(mut chunk: Chunk<'_> /* state: Arc<AtomicBool> */) {
+fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     eprintln!("worker {} connected", chunk.index);
 
     let stream = TcpStream::connect("0.0.0.0:1234").unwrap();
@@ -70,6 +57,8 @@ fn send_pixels_worker(mut chunk: Chunk<'_> /* state: Arc<AtomicBool> */) {
     stream.offset(min_x, min_y).unwrap();
 
     loop {
+        barrier.wait();
+
         for (y, row) in chunk.rows().enumerate() {
             stream.write_rgb_row(y as u16, row);
         }
@@ -78,9 +67,9 @@ fn send_pixels_worker(mut chunk: Chunk<'_> /* state: Arc<AtomicBool> */) {
 }
 
 #[inline(never)]
-fn generate_pixels_worker(mut chunk: Chunk<'_>, state: Arc<AtomicBool>) {
+fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     for i in 0.. {
-        while state.load(Ordering::Relaxed) {}
+        barrier.wait();
         // eprintln!("starting generation");
         let rows_start = chunk.rows_start;
 
@@ -112,8 +101,6 @@ fn generate_pixels_worker(mut chunk: Chunk<'_>, state: Arc<AtomicBool>) {
                 }
             }
         }
-
-        state.store(true, Ordering::Relaxed);
     }
 }
 
