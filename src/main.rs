@@ -117,7 +117,7 @@ impl EncodedU16 {
 
     fn as_bytes(&self) -> &[u8] {
         // SAFETY len is always in range 1..=5
-        &unsafe { self.bytes.get_unchecked(..self.len as usize) }
+        &unsafe { self.bytes.get_unchecked(5 - self.len as usize..) }
     }
 }
 
@@ -216,22 +216,20 @@ fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
     buffer[5] = chars[(b % 16) as usize];
 }
 
-fn encode_u16(mut value: u16, buffer: &mut [u8; 5]) -> usize {
-    let mut len = 0;
+fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
+    buffer[0] = b'0' + (value / 10_000 % 10) as u8;
+    buffer[1] = b'0' + (value / 1_000 % 10) as u8;
+    buffer[2] = b'0' + (value / 100 % 10) as u8;
+    buffer[3] = b'0' + (value / 10 % 10) as u8;
+    buffer[4] = b'0' + (value / 1 % 10) as u8;
 
-    loop {
-        buffer[len] = b'0' + (value % 10) as u8;
-        len += 1;
-        value /= 10;
-
-        if value == 0 {
-            break;
-        }
+    match value {
+        ..=9 => 1,
+        10..=99 => 2,
+        100..=999 => 3,
+        1_000..=9_999 => 4,
+        10_000.. => 5,
     }
-
-    buffer[..len].reverse();
-
-    len
 }
 
 fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
