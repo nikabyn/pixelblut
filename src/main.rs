@@ -1,5 +1,6 @@
 #![allow(static_mut_refs)]
 
+use std::boxed::BoxedArrayIntoIter;
 use std::io::{self, prelude::*};
 use std::net::TcpStream;
 use std::thread::{self, sleep};
@@ -25,6 +26,8 @@ fn main() -> std::io::Result<()> {
         thread::spawn(move || {
             let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
             let mut stream = BufTcpStream::new(stream);
+
+            // eprintln!("u16 cache size = {}", size_of_val(&*stream.u16_cache));
 
             let rows_start = chunk.rows_start;
             let color = colors[chunk.index % colors.len()];
@@ -69,7 +72,6 @@ fn main() -> std::io::Result<()> {
         }
     }
 }
-
 fn chunks(num_chunks: usize) -> impl Iterator<Item = Chunk<'static>> {
     let num_rows = HEIGHT / num_chunks;
     let row_size = WIDTH * PIXEL_SIZE;
@@ -100,37 +102,19 @@ impl<'a> Chunk<'a> {
     }
 }
 
-fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
-    let start = (x + WIDTH * y) * PIXEL_SIZE;
-    let [r, g, b] = rgb;
-
-    pixels[start] = r;
-    pixels[start + 1] = g;
-    pixels[start + 2] = b;
+struct EncodedU16 {
+    bytes: [u8; 5],
+    len: u8,
 }
 
-struct BufTcpStream {
-    inner: TcpStream,
-    buffer: [u8; Self::BUFFER_SIZE],
-    buffer_len: usize,
-}
-
-impl BufTcpStream {
-    const BUFFER_SIZE: usize = WIDTH * size_of_val(b"PX xxxx yyyy ffffff\n");
-
-    fn new(inner: TcpStream) -> Self {
-        Self {
-            inner,
-            buffer: [0; _],
-            buffer_len: 0,
-        }
-    }
-
-    fn write_u16(&mut self, mut value: u16) {
-        let start = self.buffer_len;
+impl EncodedU16 {
+    fn new(mut value: u16) -> Self {
+        let mut bytes = [b' '; 5];
+        let mut len = 0;
 
         loop {
-            self.write_byte(b'0' + (value % 10) as u8);
+            bytes[len] = b'0' + (value % 10) as u8;
+            len += 1;
             value /= 10;
 
             if value == 0 {
@@ -138,7 +122,64 @@ impl BufTcpStream {
             }
         }
 
-        self.buffer[start..self.buffer_len].reverse();
+        bytes[..len].reverse();
+
+        Self {
+            bytes,
+            len: len as u8,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY len is always in range 1..=5
+        &unsafe { self.bytes.get_unchecked(..self.len as usize) }
+    }
+}
+
+struct BufTcpStream {
+    inner: TcpStream,
+    buffer: [u8; Self::BUFFER_SIZE],
+    buffer_len: usize,
+    u16_cache: Box<[EncodedU16; 65536]>,
+}
+
+impl BufTcpStream {
+    const BUFFER_SIZE: usize = WIDTH * size_of_val(b"PX xxxxx yyyyy ffffff\n");
+
+    fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            buffer: [0; _],
+            buffer_len: 0,
+            u16_cache: {
+                let array = Box::<[EncodedU16; 65536]>::new_uninit();
+
+                unsafe {
+                    let ptr = Box::into_raw(array).cast::<EncodedU16>();
+
+                    for i in 0..=u16::MAX {
+                        ptr.add(i as usize).write(EncodedU16::new(i));
+                    }
+
+                    Box::from_raw(ptr.cast::<[EncodedU16; _]>())
+                }
+            },
+        }
+    }
+
+    #[inline(never)]
+    fn write_u16(&mut self, value: u16) {
+        assert!(self.buffer_len + 5 < self.buffer.len());
+
+        // SAFETY: value is u16 and must be less than 65536
+        let bytes = unsafe { self.u16_cache.get_unchecked(value as usize) }.as_bytes();
+
+        let new_len = self.buffer_len + bytes.len();
+
+        // SAFETY: the assert at the start of the function ensures that there is enough capacity
+        unsafe { self.buffer.get_unchecked_mut(self.buffer_len..new_len) }.copy_from_slice(&bytes);
+
+        self.buffer_len = new_len;
     }
 
     fn write_rgb_hex(&mut self, rgb: [u8; 3]) {
@@ -174,4 +215,13 @@ impl BufTcpStream {
         self.buffer_len = 0;
         Ok(())
     }
+}
+
+fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
+    let start = (x + WIDTH * y) * PIXEL_SIZE;
+    let [r, g, b] = rgb;
+
+    pixels[start] = r;
+    pixels[start + 1] = g;
+    pixels[start + 2] = b;
 }
