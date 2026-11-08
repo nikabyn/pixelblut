@@ -4,7 +4,11 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
+# fearless_simd = "1.2.0"
 
 [profile.release]
 debug = "line-tables-only"
 strip = false
+opt-level = 3
+# lto = "fat"
+codegen-units = 1

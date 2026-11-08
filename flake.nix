@@ -17,7 +17,7 @@
       # vulkan-loader
     ];
 
-    wildStdenv = pkgs.useWildLinker pkgs.stdenv;
+    # wildStdenv = pkgs.useWildLinker pkgs.stdenv;
   in {
     packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
       pname = "pixelblut";
@@ -37,7 +37,9 @@
       buildInputs = libraries;
     };
 
-    devShells.${system}.default = pkgs.mkShell.override {stdenv = wildStdenv;} {
+    devShells.${system}.default = pkgs.mkShell
+    # .override {stdenv = wildStdenv;}
+    {
       nativeBuildInputs = with pkgs; [
         rustc
         cargo

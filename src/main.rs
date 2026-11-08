@@ -22,10 +22,10 @@ fn main() -> std::io::Result<()> {
         [0, 255, 255],
     ];
 
-    for mut chunk in chunks(240) {
+    for mut chunk in chunks(16) {
         thread::spawn(move || {
             let stream = TcpStream::connect("10.42.0.1:1234").unwrap();
-            let mut stream = BufTcpStream::new(stream);
+            let mut stream = PixelflutStream::new(stream);
 
             // eprintln!("u16 cache size = {}", size_of_val(&*stream.u16_cache));
 
@@ -38,13 +38,11 @@ fn main() -> std::io::Result<()> {
                         .iter()
                         .enumerate()
                     {
-                        stream.write_bytes(b"PX ");
-                        stream.write_u16(x as u16);
-                        stream.write_byte(b' ');
-                        stream.write_u16(y as u16);
-                        stream.write_byte(b' ');
-                        stream.write_rgb_hex(if i % 2 == 0 { color } else { *rgb });
-                        stream.write_byte(b'\n');
+                        stream.write_px_rgb(
+                            x as u16,
+                            y as u16,
+                            if i % 2 == 0 { color } else { *rgb },
+                        );
                     }
 
                     stream.flush().unwrap();
@@ -136,14 +134,14 @@ impl EncodedU16 {
     }
 }
 
-struct BufTcpStream {
+struct PixelflutStream {
     inner: TcpStream,
     buffer: [u8; Self::BUFFER_SIZE],
     buffer_len: usize,
     u16_cache: Box<[EncodedU16; 65536]>,
 }
 
-impl BufTcpStream {
+impl PixelflutStream {
     const BUFFER_SIZE: usize = WIDTH * size_of_val(b"PX xxxxx yyyyy ffffff\n");
 
     fn new(inner: TcpStream) -> Self {
@@ -168,45 +166,45 @@ impl BufTcpStream {
     }
 
     #[inline(never)]
-    fn write_u16(&mut self, value: u16) {
-        assert!(self.buffer_len + 5 < self.buffer.len());
+    fn write_px_rgb(&mut self, x: u16, y: u16, rgb: [u8; 3]) {
+        // SAFETY: values are u16 and must be less than 65536
+        let x = unsafe { self.u16_cache.get_unchecked(x as usize) }.as_bytes();
+        let y = unsafe { self.u16_cache.get_unchecked(y as usize) }.as_bytes();
 
-        // SAFETY: value is u16 and must be less than 65536
-        let bytes = unsafe { self.u16_cache.get_unchecked(value as usize) }.as_bytes();
+        let len =
+            size_of_val(b"PX ") + x.len() + size_of_val(b" ") + y.len() + size_of_val(" rrggbb\n");
 
-        let new_len = self.buffer_len + bytes.len();
+        let start = self.buffer_len;
+        let end = start + len;
+        let out = &mut self.buffer[start..end];
+        let mut pos = 0;
 
-        // SAFETY: the assert at the start of the function ensures that there is enough capacity
-        unsafe { self.buffer.get_unchecked_mut(self.buffer_len..new_len) }.copy_from_slice(&bytes);
+        out[pos..pos + 3].copy_from_slice(b"PX ");
+        pos += 3;
 
-        self.buffer_len = new_len;
-    }
+        out[pos..pos + x.len()].copy_from_slice(x);
+        pos += x.len();
 
-    fn write_rgb_hex(&mut self, rgb: [u8; 3]) {
-        let chars = b"0123456789abcdef";
+        out[pos] = b' ';
+        pos += 1;
 
-        let new_len = self.buffer_len + 6;
-        let buffer = &mut self.buffer[self.buffer_len..new_len];
-        let [r, g, b] = rgb;
-        buffer[0] = chars[(r / 16) as usize];
-        buffer[1] = chars[(r % 16) as usize];
-        buffer[2] = chars[(g / 16) as usize];
-        buffer[3] = chars[(g % 16) as usize];
-        buffer[4] = chars[(b / 16) as usize];
-        buffer[5] = chars[(b % 16) as usize];
+        out[pos..pos + y.len()].copy_from_slice(y);
+        pos += y.len();
 
-        self.buffer_len = new_len;
-    }
+        out[pos] = b' ';
+        pos += 1;
 
-    fn write_bytes(&mut self, bytes: &[u8]) {
-        let new_len = self.buffer_len + bytes.len();
-        self.buffer[self.buffer_len..new_len].copy_from_slice(bytes);
-        self.buffer_len = new_len;
-    }
+        encode_rgb_hex(rgb, {
+            let hex_buffer = out[pos..pos + 6].as_mut_array();
+            // SAFETY slice has constant length 6
+            unsafe { hex_buffer.unwrap_unchecked() }
+        });
+        pos += 6;
 
-    fn write_byte(&mut self, byte: u8) {
-        self.buffer[self.buffer_len] = byte;
-        self.buffer_len += 1;
+        out[pos] = b'\n';
+        pos += 1;
+
+        self.buffer_len += pos;
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -215,6 +213,18 @@ impl BufTcpStream {
         self.buffer_len = 0;
         Ok(())
     }
+}
+
+fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
+    let chars = b"0123456789abcdef";
+
+    let [r, g, b] = rgb;
+    buffer[0] = chars[(r / 16) as usize];
+    buffer[1] = chars[(r % 16) as usize];
+    buffer[2] = chars[(g / 16) as usize];
+    buffer[3] = chars[(g % 16) as usize];
+    buffer[4] = chars[(b / 16) as usize];
+    buffer[5] = chars[(b % 16) as usize];
 }
 
 fn set_pixel(pixels: &mut [u8; PIXEL_SIZE * WIDTH * HEIGHT], x: usize, y: usize, rgb: [u8; 3]) {
