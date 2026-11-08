@@ -17,7 +17,7 @@ use std::time::Instant;
 const ADDR: &str = "10.10.10.2:1234";
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
-const NUM_SEND_THREADS: usize = 135;
+const NUM_SEND_THREADS: usize = 108;
 const NUM_GEN_THREADS: usize = 4;
 
 // local
@@ -60,7 +60,7 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-#[inline(never)]
+// #[inline(never)]
 fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     // eprintln!("worker {} connected", chunk.index);
 
@@ -83,7 +83,7 @@ fn send_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     }
 }
 
-#[inline(never)]
+// #[inline(never)]
 fn generate_pixels_worker(mut chunk: Chunk<'_>, barrier: Arc<Barrier>) {
     let start = Instant::now();
 
@@ -168,7 +168,7 @@ struct PixelflutStream {
 }
 
 impl PixelflutStream {
-    #[inline(never)]
+    // #[inline(never)]
     fn new(inner: TcpStream, width: u16, height: u16) -> Self {
         // inner.set_nodelay(true).unwrap();
 
@@ -217,7 +217,7 @@ impl PixelflutStream {
         y as usize * width as usize + x as usize
     }
 
-    #[inline(never)]
+    // #[inline(never)]
     fn write_rgb_row(&mut self, y: u16, row: &[u8]) {
         static HEX_U8: [u16; 256] = {
             let mut table = [0; 256];
@@ -270,7 +270,7 @@ impl PixelflutStream {
             .write_all(format!("OFFSET {offset_x} {offset_y}\n").as_bytes())
     }
 
-    #[inline(never)]
+    // #[inline(never)]
     fn flush(&mut self) -> io::Result<()> {
         // eprintln!("{}", String::from_utf8_lossy(&self.cache));
         self.inner.write_all(&self.cache)
@@ -287,7 +287,6 @@ fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
     digits_u16(value)
 }
 
-#[inline]
 fn digits_u16(value: u16) -> usize {
     match value {
         ..=9 => 1,
