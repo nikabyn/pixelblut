@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 mod encode;
 use encode::PIXEL_SIZE;
 
+use crate::encode::PxFrameEncoder;
+
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
 // const WIDTH: usize = 960;
@@ -197,8 +199,7 @@ unsafe impl Send for Chunk {}
 
 struct PixelflutStream {
     inner: TcpStream,
-    cache: Box<[u8]>,
-    rgb_offsets: Box<[usize]>,
+    encoder: PxFrameEncoder,
     offset_x: u16,
     offset_y: u16,
     width: u16,
@@ -210,12 +211,9 @@ impl PixelflutStream {
         let inner = TcpStream::connect(addr).unwrap();
         inner.set_nonblocking(true).unwrap();
 
-        let (cache, rgb_offsets) = encode::setup_cache(width, height);
-
         let mut stream = Self {
             inner,
-            cache,
-            rgb_offsets,
+            encoder: PxFrameEncoder::new(width, height),
             offset_x,
             offset_y,
             width,
@@ -233,7 +231,7 @@ impl PixelflutStream {
     }
 
     fn write_rgb_row(&mut self, y: u16, row: &[u8]) {
-        unsafe { encode::update_row(&mut self.cache, &self.rgb_offsets, y, self.width, row) };
+        unsafe { self.encoder.update_row(y, row) };
     }
 
     fn flush_offset(&mut self) -> io::Result<()> {
@@ -245,7 +243,7 @@ impl PixelflutStream {
     fn flush(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         let start = Instant::now();
 
-        let mut buf = &*self.cache;
+        let mut buf = &*self.encoder.cache;
         while !buf.is_empty() {
             if let Some(timeout) = timeout
                 && start.elapsed() > timeout
