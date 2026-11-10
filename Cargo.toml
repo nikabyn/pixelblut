@@ -4,6 +4,7 @@ version = "0.0.0"
 edition = "2024"
 
 [dependencies]
+chron = "0.1.6"
 # fearless_simd = "1.2.0"
 
 [profile.release]

@@ -3,5 +3,14 @@
 version = 4
 
 [[package]]
+name = "chron"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902a6b86f517bf4c50564bfd1b3d035a58054c4c1fc6ffcbaa8eb016672fc0eb"
+
+[[package]]
 name = "pixelblut"
 version = "0.0.0"
+dependencies = [
+ "chron",
+]

@@ -1,8 +1,9 @@
 use std::io::{self, Write};
 use std::net::TcpStream;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Barrier};
-use std::thread::{self, park};
-use std::time::Instant;
+use std::thread::{self, park_timeout};
+use std::time::{Duration, Instant};
 
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
@@ -10,13 +11,16 @@ use std::time::Instant;
 // const HEIGHT: usize = 480;
 // const NUM_SEND_THREADS: usize = 480 / 8;
 // const NUM_GEN_THREADS: usize = 4;
+// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(200));
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
-const NUM_SEND_THREADS: usize = 324;
+const NUM_SEND_THREADS: usize = 1;
 const NUM_GEN_THREADS: usize = 8;
+const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(500));
+// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
@@ -24,23 +28,25 @@ const NUM_GEN_THREADS: usize = 8;
 // const HEIGHT: usize = 1080;
 // const NUM_SEND_THREADS: usize = 8;
 // const NUM_GEN_THREADS: usize = 8;
+// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 const PIXEL_SIZE: usize = 3;
 static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
 
 fn main() -> std::io::Result<()> {
-    let stream = TcpStream::connect(ADDR).unwrap();
-    let mut clear = PixelflutStream::new(stream, 1920, 1080);
+    let mut clear = PixelflutStream::new(ADDR, 0, 0, 1920, 1080);
     for y in 0..1080 {
         clear.write_rgb_row(y as u16, &[0_u8; 1920 * PIXEL_SIZE]);
     }
-    clear.flush().unwrap();
+    clear.flush(None).unwrap();
     drop(clear);
 
-    let chunks_x = NUM_SEND_THREADS.isqrt();
+    let aspect_ratio = WIDTH as f64 / HEIGHT as f64;
+
+    let chunks_x = ((NUM_SEND_THREADS as f64 * aspect_ratio).sqrt()).round() as usize;
     let chunks_y = NUM_SEND_THREADS.div_ceil(chunks_x);
 
-    let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_SEND_THREADS));
+    let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(0));
     for chunk in chunks(chunks_x, chunks_y) {
         let send_barrier = send_barrier.clone();
         thread::spawn(|| {
@@ -48,78 +54,77 @@ fn main() -> std::io::Result<()> {
         });
     }
 
-    let chunks_x = NUM_GEN_THREADS.isqrt();
-    let chunks_y = NUM_GEN_THREADS.div_ceil(chunks_x);
-
-    let generate_barrier: Arc<Barrier> = Arc::new(Barrier::new(NUM_GEN_THREADS));
-    for chunk in chunks(chunks_x, chunks_y) {
-        let generate_barrier = generate_barrier.clone();
-        thread::spawn(|| {
-            generate_pixels_worker(chunk, generate_barrier);
-        });
-    }
-
-    loop {
-        park();
-    }
+    generate_pixels();
 }
 
 // #[inline(never)]
 fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
     // eprintln!("worker {} connected", chunk.index);
 
-    let stream = TcpStream::connect(ADDR).unwrap();
     let min_x: u16 = chunk.offset_x as u16;
     let min_y: u16 = chunk.offset_y as u16;
     let max_x: u16 = min_x + chunk.width as u16;
     let max_y: u16 = min_y + chunk.height as u16;
 
-    let mut stream = PixelflutStream::new(stream, max_x - min_x, max_y - min_y);
-    stream.offset(min_x, min_y).unwrap();
+    let mut stream = PixelflutStream::new(ADDR, min_x, min_y, max_x - min_x, max_y - min_y);
 
+    let mut start = Instant::now();
+    let mut i = 0;
     loop {
         barrier.wait();
 
         for (y, row) in chunk.rows().enumerate() {
             stream.write_rgb_row(y as u16, row);
         }
-        stream.flush().unwrap();
+        if let Err(err) = stream.flush(CHUNK_FLUSH_TIMEOUT)
+            && err.kind() == io::ErrorKind::TimedOut
+        {
+            eprintln!("Flush timed out!");
+            stream.reconnect_tcp().unwrap();
+        }
+
+        if start.elapsed() > Duration::from_millis(1000) {
+            let delta_t = start.elapsed() / (i + 1);
+            let send_fps = Duration::from_secs(1).as_nanos() / delta_t.as_nanos();
+            eprintln!("send time = {delta_t:?}");
+            // eprintln!("send fps = {send_fps:?}");
+            i = 0;
+            start = Instant::now();
+        }
+        i += 1;
     }
 }
 
-// #[inline(never)]
-fn generate_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
+fn generate_pixels() -> ! {
+    let base = (&raw mut PIXEL_BUFFER).cast::<[u8; 3]>();
+
+    let max_fps = NonZeroU32::new(60).unwrap();
+    let clock = chron::Clock::new(NonZeroU32::new(120).unwrap()).max_frame_rate(max_fps);
+
     let start = Instant::now();
+    for tick in clock {
+        if matches!(tick, chron::Tick::Update) {
+            continue;
+        }
 
-    loop {
-        barrier.wait();
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(start).as_secs_f32();
-        let t = (elapsed % 5.0) / 5.0;
-
-        let offset_x = chunk.offset_x;
-        let offset_y = chunk.offset_y;
+        let elapsed = start.elapsed().as_secs_f32();
+        let t = (elapsed % 1.0) / 1.0;
 
         let box_center_x =
             (WIDTH as i32 / 2 + ((WIDTH / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
         let box_center_y =
             (HEIGHT as i32 / 2 - ((HEIGHT / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
-        let box_width = 200;
-        let box_height = 200;
+        let box_width = 40;
+        let box_height = 40;
         let box_x = (box_center_x - box_width / 2)..(box_center_x + box_width / 2);
         let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
 
-        for (row_index, row) in chunk.rows().enumerate() {
-            let y = row_index + offset_y;
-            let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
-            for (local_x, rgb) in unsafe { row.as_chunks_unchecked_mut::<3>() }
-                .iter_mut()
-                .enumerate()
-            {
-                let x = local_x + offset_x;
+        for y in 0..HEIGHT {
+            let base = unsafe { base.add(y * WIDTH) };
 
-                let [r, g, b] = rgb;
+            let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
+            for x in 0..WIDTH {
+                let [r, g, b] = unsafe { base.add(x).as_mut_unchecked() };
                 let u = (x as f32 / WIDTH as f32 * 255.0) as u8;
                 *r = (u as f32 * t) as u8;
                 *g = (v as f32 * t) as u8;
@@ -133,6 +138,8 @@ fn generate_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
             }
         }
     }
+
+    unreachable!()
 }
 
 fn chunks(chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
@@ -197,9 +204,9 @@ struct PixelflutStream {
 }
 
 impl PixelflutStream {
-    // #[inline(never)]
-    fn new(inner: TcpStream, width: u16, height: u16) -> Self {
-        // inner.set_nodelay(true).unwrap();
+    fn new(addr: &str, offset_x: u16, offset_y: u16, width: u16, height: u16) -> Self {
+        let inner = TcpStream::connect(addr).unwrap();
+        inner.set_nonblocking(true).unwrap();
 
         let mut cache = Vec::with_capacity(
             width as usize * height as usize * size_of_val(b"PX xxxxx yyyyy ffffff\n"),
@@ -231,22 +238,34 @@ impl PixelflutStream {
         }
 
         cache.shrink_to_fit();
-        Self {
+
+        dbg!(cache.len());
+
+        let mut stream = Self {
             inner,
             cache: cache.into_boxed_slice(),
             rgb_offsets: rgb_offsets.into_boxed_slice(),
-            offset_x: 0,
-            offset_y: 0,
+            offset_x,
+            offset_y,
             width,
             height,
-        }
+        };
+        stream.flush_offset().unwrap();
+        stream
+    }
+
+    fn reconnect_tcp(&mut self) -> io::Result<()> {
+        let new_tcp = TcpStream::connect(ADDR)?;
+        new_tcp.set_nonblocking(true)?;
+        _ = std::mem::replace(&mut self.inner, new_tcp);
+        self.flush_offset()
     }
 
     fn pixel_key(x: u16, y: u16, width: u16) -> usize {
         y as usize * width as usize + x as usize
     }
 
-    // #[inline(never)]
+    #[inline(never)]
     fn write_rgb_row(&mut self, y: u16, row: &[u8]) {
         static HEX_U8: [u16; 256] = {
             let mut table = [0; 256];
@@ -292,17 +311,39 @@ impl PixelflutStream {
         }
     }
 
-    fn offset(&mut self, offset_x: u16, offset_y: u16) -> io::Result<()> {
-        self.offset_x = offset_x;
-        self.offset_y = offset_y;
+    fn flush_offset(&mut self) -> io::Result<()> {
         self.inner
-            .write_all(format!("OFFSET {offset_x} {offset_y}\n").as_bytes())
+            .write_all(format!("OFFSET {} {}\n", self.offset_x, self.offset_y).as_bytes())
     }
 
-    // #[inline(never)]
-    fn flush(&mut self) -> io::Result<()> {
+    #[inline(never)]
+    fn flush(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        let start = Instant::now();
+
+        let mut buf = &*self.cache;
+        while !buf.is_empty() {
+            if let Some(timeout) = timeout
+                && start.elapsed() > timeout
+            {
+                _ = self.inner.write_all(b"\n");
+                return Err(io::Error::new(io::ErrorKind::TimedOut, ""));
+            }
+
+            match self.inner.write(buf) {
+                Ok(0) => break,
+                Ok(n) => buf = &buf[n..],
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    park_timeout(Duration::from_micros(10));
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+
+        Ok(())
+
         // eprintln!("{}", String::from_utf8_lossy(&self.cache));
-        self.inner.write_all(&self.cache)
+        // self.inner.write_all(&self.cache)
     }
 }
 
@@ -336,4 +377,43 @@ fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
     buffer[3] = chars[(g % 16) as usize];
     buffer[4] = chars[(b / 16) as usize];
     buffer[5] = chars[(b % 16) as usize];
+}
+
+#[test]
+fn benchmark_encode() {
+    const WIDTH: usize = 1920;
+    const HEIGHT: usize = 1080;
+    static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
+
+    for (i, byte) in unsafe { PIXEL_BUFFER }.iter_mut().enumerate() {
+        *byte = match i {
+            0..12 => 0x0f,
+            15..52 => 0x12,
+            60..80 => 0xff,
+            100..200 => i as u8,
+            _ => 0x00,
+        };
+    }
+
+    let mut chunk = Chunk {
+        pixels: (&raw mut PIXEL_BUFFER).cast::<u8>(),
+        offset_x: 0,
+        offset_y: 0,
+        width: 1920,
+        height: 1080,
+    };
+
+    let mut stream = PixelflutStream::new(ADDR, 0, 0, 1920, 1080);
+
+    let iterations = 100;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        for (y, row) in chunk.rows().enumerate() {
+            stream.write_rgb_row(y as u16, row);
+        }
+    }
+    let average_encode_t = start.elapsed() / iterations;
+    let average_encode_fps = Duration::from_secs(1).as_nanos() / average_encode_t.as_nanos();
+    println!("average encode time = {average_encode_t:?}");
+    println!("average encode fps = {average_encode_fps:?}");
 }
