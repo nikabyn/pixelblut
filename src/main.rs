@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
-use std::thread::{self, park_timeout};
+use std::thread;
 use std::time::{Duration, Instant};
 
 mod render;
@@ -16,7 +16,6 @@ use encode::{PIXEL_SIZE, PxFrameEncoder};
 // const HEIGHT: usize = 480;
 // const NUM_SEND_THREADS: usize = 1;
 // const NUM_GEN_THREADS: usize = 4;
-// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
@@ -24,8 +23,6 @@ const WIDTH: usize = 1920 / 2;
 const HEIGHT: usize = 1080 / 2;
 const NUM_SEND_THREADS: usize = 1;
 const NUM_GEN_THREADS: usize = 8;
-// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(500));
-const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
@@ -33,7 +30,6 @@ const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 // const HEIGHT: usize = 1080;
 // const NUM_SEND_THREADS: usize = 8;
 // const NUM_GEN_THREADS: usize = 8;
-// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 fn main() -> std::io::Result<()> {
     static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
@@ -43,7 +39,7 @@ fn main() -> std::io::Result<()> {
     for y in 0..1080 {
         clear.write_rgb_row(y as u16, &[[0; 3]; 1920]);
     }
-    clear.flush(None).unwrap();
+    clear.flush().unwrap();
     drop(clear);
 
     let aspect_ratio = WIDTH as f64 / HEIGHT as f64;
@@ -62,7 +58,6 @@ fn main() -> std::io::Result<()> {
     run_render_loop(pixels, WIDTH, HEIGHT);
 }
 
-// #[inline(never)]
 fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
     // eprintln!("worker {} connected", chunk.index);
 
@@ -81,12 +76,7 @@ fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
         for (y, row) in chunk.rows().enumerate() {
             stream.write_rgb_row(y as u16, row);
         }
-        if let Err(err) = stream.flush(CHUNK_FLUSH_TIMEOUT)
-            && err.kind() == io::ErrorKind::TimedOut
-        {
-            eprintln!("Flush timed out!");
-            stream.reconnect_tcp().unwrap();
-        }
+        stream.flush().unwrap();
 
         if start.elapsed() > Duration::from_millis(1000) {
             let delta_t = start.elapsed() / (i + 1);
@@ -160,7 +150,8 @@ struct PixelflutStream {
 impl PixelflutStream {
     fn new(addr: &str, offset_x: u16, offset_y: u16, width: u16, height: u16) -> Self {
         let inner = TcpStream::connect(addr).unwrap();
-        inner.set_nonblocking(true).unwrap();
+        inner.set_nodelay(true).unwrap();
+        inner.set_nonblocking(false).unwrap();
 
         let mut stream = Self {
             inner,
@@ -190,33 +181,8 @@ impl PixelflutStream {
             .write_all(format!("OFFSET {} {}\n", self.offset_x, self.offset_y).as_bytes())
     }
 
-    #[inline(never)]
-    fn flush(&mut self, timeout: Option<Duration>) -> io::Result<()> {
-        let start = Instant::now();
-
-        let mut buf = &*self.encoder.encoded();
-        while !buf.is_empty() {
-            if let Some(timeout) = timeout
-                && start.elapsed() > timeout
-            {
-                _ = self.inner.write_all(b"\n");
-                return Err(io::Error::new(io::ErrorKind::TimedOut, ""));
-            }
-
-            match self.inner.write(buf) {
-                Ok(0) => break,
-                Ok(n) => buf = &buf[n..],
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    park_timeout(Duration::from_micros(10));
-                }
-                Err(e) => eprintln!("{e}"),
-            }
-        }
-
-        Ok(())
-
+    fn flush(&mut self) -> io::Result<()> {
         // eprintln!("{}", String::from_utf8_lossy(&self.cache));
-        // self.inner.write_all(&self.cache)
+        self.inner.write_all(&self.encoder.encoded())
     }
 }
