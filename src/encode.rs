@@ -168,6 +168,5 @@ fn benchmark_encode() {
     let average_encode_t: Duration =
         encode_times.into_iter().reduce(|a, b| a + b).unwrap() / iterations;
     let average_encode_fps = Duration::from_secs(1).as_nanos() / average_encode_t.as_nanos();
-    println!("average encode time = {average_encode_t:?}");
-    println!("average encode fps = {average_encode_fps:?}");
+    println!("average: {average_encode_t:?} per frame, {average_encode_fps:?}fps");
 }

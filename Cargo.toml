@@ -12,4 +12,4 @@ debug = "line-tables-only"
 strip = false
 opt-level = 3
 # lto = "fat"
-codegen-units = 1
+# codegen-units = 1

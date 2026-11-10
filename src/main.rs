@@ -12,18 +12,18 @@ use encode::PIXEL_SIZE;
 // const ADDR: &str = "10.42.0.1:1234";
 // const WIDTH: usize = 960;
 // const HEIGHT: usize = 480;
-// const NUM_SEND_THREADS: usize = 480 / 8;
+// const NUM_SEND_THREADS: usize = 1;
 // const NUM_GEN_THREADS: usize = 4;
-// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(200));
+// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
-const WIDTH: usize = 1920 / 2;
-const HEIGHT: usize = 1080 / 2;
+const WIDTH: usize = 1920;
+const HEIGHT: usize = 1080;
 const NUM_SEND_THREADS: usize = 1;
 const NUM_GEN_THREADS: usize = 8;
-const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(500));
-// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
+// const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(500));
+const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
