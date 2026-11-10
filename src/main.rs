@@ -1,14 +1,14 @@
 use std::io::{self, Write};
 use std::net::TcpStream;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Barrier};
 use std::thread::{self, park_timeout};
 use std::time::{Duration, Instant};
 
-mod encode;
-use encode::PIXEL_SIZE;
+mod render;
+use render::*;
 
-use crate::encode::PxFrameEncoder;
+mod encode;
+use encode::{PIXEL_SIZE, PxFrameEncoder};
 
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
@@ -20,8 +20,8 @@ use crate::encode::PxFrameEncoder;
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
-const WIDTH: usize = 1920;
-const HEIGHT: usize = 1080;
+const WIDTH: usize = 1920 / 2;
+const HEIGHT: usize = 1080 / 2;
 const NUM_SEND_THREADS: usize = 1;
 const NUM_GEN_THREADS: usize = 8;
 // const CHUNK_FLUSH_TIMEOUT: Option<Duration> = Some(Duration::from_millis(500));
@@ -35,12 +35,13 @@ const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 // const NUM_GEN_THREADS: usize = 8;
 // const CHUNK_FLUSH_TIMEOUT: Option<Duration> = None;
 
-static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
-
 fn main() -> std::io::Result<()> {
+    static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
+    let pixels = (&raw mut PIXEL_BUFFER).cast::<[u8; 3]>();
+
     let mut clear = PixelflutStream::new(ADDR, 0, 0, 1920, 1080);
     for y in 0..1080 {
-        clear.write_rgb_row(y as u16, &[0_u8; 1920 * PIXEL_SIZE]);
+        clear.write_rgb_row(y as u16, &[[0; 3]; 1920]);
     }
     clear.flush(None).unwrap();
     drop(clear);
@@ -51,14 +52,14 @@ fn main() -> std::io::Result<()> {
     let chunks_y = NUM_SEND_THREADS.div_ceil(chunks_x);
 
     let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(0));
-    for chunk in chunks(chunks_x, chunks_y) {
+    for chunk in chunks(pixels, chunks_x, chunks_y) {
         let send_barrier = send_barrier.clone();
         thread::spawn(|| {
             send_pixels_worker(chunk, send_barrier);
         });
     }
 
-    generate_pixels();
+    run_render_loop(pixels, WIDTH, HEIGHT);
 }
 
 // #[inline(never)]
@@ -99,56 +100,7 @@ fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
     }
 }
 
-fn generate_pixels() -> ! {
-    let base = (&raw mut PIXEL_BUFFER).cast::<[u8; 3]>();
-
-    let max_fps = NonZeroU32::new(60).unwrap();
-    let clock = chron::Clock::new(NonZeroU32::new(120).unwrap()).max_frame_rate(max_fps);
-
-    let start = Instant::now();
-    for tick in clock {
-        if matches!(tick, chron::Tick::Update) {
-            continue;
-        }
-
-        let elapsed = start.elapsed().as_secs_f32();
-        let t = (elapsed % 1.0) / 1.0;
-
-        let box_center_x =
-            (WIDTH as i32 / 2 + ((WIDTH / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
-        let box_center_y =
-            (HEIGHT as i32 / 2 - ((HEIGHT / 2) as f32 * (t * 2.0 - 1.0)) as i32) as usize;
-        let box_width = 40;
-        let box_height = 40;
-        let box_x = (box_center_x - box_width / 2)..(box_center_x + box_width / 2);
-        let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
-
-        for y in 0..HEIGHT {
-            let base = unsafe { base.add(y * WIDTH) };
-
-            let v = (y as f32 / HEIGHT as f32 * 255.0) as u8;
-            for x in 0..WIDTH {
-                let [r, g, b] = unsafe { base.add(x).as_mut_unchecked() };
-                let u = (x as f32 / WIDTH as f32 * 255.0) as u8;
-                *r = (u as f32 * t) as u8;
-                *g = (v as f32 * t) as u8;
-                *b = 0;
-
-                if box_x.contains(&x) && box_y.contains(&y) {
-                    *r = 0xff;
-                    *g = 0xff;
-                    *b = 0xff;
-                }
-            }
-        }
-    }
-
-    unreachable!()
-}
-
-fn chunks(chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
-    let base = (&raw mut PIXEL_BUFFER).cast::<u8>();
-
+fn chunks(pixels: *mut [u8; 3], chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
     (0..chunks_x)
         .flat_map(move |x| (0..chunks_y).map(move |y| (x, y)))
         .map(move |(index_x, index_y)| {
@@ -161,10 +113,10 @@ fn chunks(chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
             let width = end_x - offset_x;
             let height = end_y - offset_y;
 
-            let offset = offset_y * WIDTH * PIXEL_SIZE + offset_x * PIXEL_SIZE;
+            let offset = offset_y * WIDTH + offset_x;
 
             Chunk {
-                pixels: unsafe { base.add(offset) },
+                pixels: unsafe { pixels.add(offset) },
                 offset_x,
                 offset_y,
                 width,
@@ -174,7 +126,7 @@ fn chunks(chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
 }
 
 struct Chunk {
-    pixels: *mut u8,
+    pixels: *mut [u8; 3],
     offset_x: usize,
     offset_y: usize,
     width: usize,
@@ -182,14 +134,13 @@ struct Chunk {
 }
 
 impl Chunk {
-    fn rows(&mut self) -> impl Iterator<Item = &mut [u8]> + '_ {
+    fn rows(&mut self) -> impl Iterator<Item = &mut [[u8; 3]]> + '_ {
         let pixels = self.pixels;
         let width = self.width;
         let height = self.height;
 
-        (0..height).map(move |y| unsafe {
-            std::slice::from_raw_parts_mut(pixels.add(y * WIDTH * PIXEL_SIZE), width * PIXEL_SIZE)
-        })
+        (0..height)
+            .map(move |y| unsafe { std::slice::from_raw_parts_mut(pixels.add(y * WIDTH), width) })
     }
 }
 
@@ -230,7 +181,7 @@ impl PixelflutStream {
         self.flush_offset()
     }
 
-    fn write_rgb_row(&mut self, y: u16, row: &[u8]) {
+    fn write_rgb_row(&mut self, y: u16, row: &[[u8; 3]]) {
         unsafe { self.encoder.update_row(y, row) };
     }
 

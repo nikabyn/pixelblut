@@ -48,7 +48,7 @@ impl PxFrameEncoder {
         }
     }
 
-    pub unsafe fn update_row(&mut self, row_y: u16, row_data: &[u8]) {
+    pub unsafe fn update_row(&mut self, row_y: u16, row_data: &[[u8; 3]]) {
         static HEX_U8: [u16; 256] = {
             let mut table = [0; 256];
             let chars = b"0123456789abcdef";
@@ -67,10 +67,7 @@ impl PxFrameEncoder {
         let mut offset = unsafe { *self.offsets.get_unchecked(start_key) };
         let mut stride = size_of_val(b"PX   ffffff\n").wrapping_add(digits_u16(row_y));
 
-        for (x, [r, g, b]) in unsafe { row_data.as_chunks_unchecked::<3>() }
-            .iter()
-            .enumerate()
-        {
+        for (x, [r, g, b]) in row_data.iter().enumerate() {
             let inc_stride = x == 0 || x == 9 || x == 99 || x == 999 || x == 9999;
             stride = stride.wrapping_add(1 * inc_stride as usize);
 
@@ -134,16 +131,18 @@ fn benchmark_encode() {
 
     const WIDTH: usize = 1920;
     const HEIGHT: usize = 1080;
-    let mut pixels = Box::new([0; PIXEL_SIZE * WIDTH * HEIGHT]);
+    let mut pixels = Box::new([[0; 3]; WIDTH * HEIGHT]);
 
-    for (i, byte) in pixels.iter_mut().enumerate() {
-        *byte = match i {
-            0..12 => 0x0f,
-            15..52 => 0x12,
-            60..80 => 0xff,
-            100..200 => i as u8,
-            _ => 0x00,
-        };
+    for (i, rgb) in pixels.iter_mut().enumerate() {
+        for byte in rgb {
+            *byte = match i {
+                0..12 => 0x0f,
+                15..52 => 0x12,
+                60..80 => 0xff,
+                100..200 => i as u8,
+                _ => 0x00,
+            };
+        }
     }
 
     let mut chunk = Chunk {
@@ -165,12 +164,14 @@ fn benchmark_encode() {
         }
         encode_times.push(start.elapsed());
 
-        for (i, byte) in pixels.iter_mut().enumerate() {
-            *byte = match i {
-                0..100 => 255 - *byte,
-                100..200 => *byte - (i % 255) as u8,
-                _ => *byte % 125,
-            };
+        for (i, rgb) in pixels.iter_mut().enumerate() {
+            for byte in rgb {
+                *byte = match i {
+                    0..100 => 255 - *byte,
+                    100..200 => *byte - (i % 255) as u8,
+                    _ => *byte % 125,
+                };
+            }
         }
     }
     let average_encode_t: Duration =
