@@ -194,7 +194,7 @@ impl PixelflutStream {
     fn flush(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         let start = Instant::now();
 
-        let mut buf = &*self.encoder.cache;
+        let mut buf = &*self.encoder.encoded();
         while !buf.is_empty() {
             if let Some(timeout) = timeout
                 && start.elapsed() > timeout

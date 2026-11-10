@@ -1,7 +1,7 @@
 pub const PIXEL_SIZE: usize = 3;
 
 pub struct PxFrameEncoder {
-    pub cache: Box<[u8]>,
+    cache: Box<[u8]>,
     offsets: Box<[usize]>,
     width: u16,
     height: u16,
@@ -85,6 +85,10 @@ impl PxFrameEncoder {
 
             offset = offset.wrapping_add(stride);
         }
+    }
+
+    pub fn encoded(&self) -> &[u8] {
+        &self.cache
     }
 }
 
@@ -174,6 +178,8 @@ fn benchmark_encode() {
             }
         }
     }
+
+    println!("{:?}", encoder.encoded().iter().sum::<u8>());
     let average_encode_t: Duration =
         encode_times.into_iter().reduce(|a, b| a + b).unwrap() / iterations;
     let average_encode_fps = Duration::from_secs(1).as_nanos() / average_encode_t.as_nanos();
