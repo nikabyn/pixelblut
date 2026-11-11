@@ -1,3 +1,5 @@
+use std::mem::transmute;
+
 pub struct PxFrameEncoder {
     cache: Box<[u8]>,
     offsets: Box<[usize]>,
@@ -46,7 +48,9 @@ impl PxFrameEncoder {
         }
     }
 
-    pub unsafe fn update_row(&mut self, row_y: u16, row_data: &[[u8; 3]]) {
+    pub fn update_row(&mut self, row_y: u16, row_data: &[[u8; 3]]) {
+        assert!(row_y < self.height && row_data.len() == self.width as usize);
+
         static HEX_U8: [u16; 256] = {
             let mut table = [0; 256];
             let chars = b"0123456789abcdef";
@@ -62,24 +66,17 @@ impl PxFrameEncoder {
 
         let start_key = pixel_key(0, row_y, self.width);
 
-        let mut offset = unsafe { *self.offsets.get_unchecked(start_key) };
+        let mut offset = self.offsets[start_key];
         let mut stride = size_of_val(b"PX   ffffff\n").wrapping_add(digits_u16(row_y));
 
         for (x, [r, g, b]) in row_data.iter().enumerate() {
             let inc_stride = x == 0 || x == 9 || x == 99 || x == 999 || x == 9999;
             stride = stride.wrapping_add(1 * inc_stride as usize);
 
-            let r = HEX_U8[*r as usize];
-            let g = HEX_U8[*g as usize];
-            let b = HEX_U8[*b as usize];
-
-            unsafe {
-                let dst = self.cache.as_mut_ptr().add(offset).cast::<u16>();
-
-                dst.write_unaligned(r);
-                dst.add(1).write_unaligned(g);
-                dst.add(2).write_unaligned(b);
-            }
+            let dst: &mut [u16] = unsafe { transmute(&mut self.cache[offset..]) };
+            dst[0] = HEX_U8[*r as usize];
+            dst[1] = HEX_U8[*g as usize];
+            dst[2] = HEX_U8[*b as usize];
 
             offset = offset.wrapping_add(stride);
         }
@@ -153,7 +150,7 @@ fn benchmark_encode() {
     for _ in 0..iterations {
         let start = Instant::now();
         for (row_y, row_data) in pixels.chunks_exact_mut(WIDTH).enumerate() {
-            unsafe { encoder.update_row(row_y as u16, row_data) };
+            encoder.update_row(row_y as u16, row_data);
         }
         encode_times.push(start.elapsed());
 

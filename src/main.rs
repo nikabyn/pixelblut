@@ -40,11 +40,11 @@ fn render(pixels: &mut Pixels, t_secs: f32) {
     let box_y = (box_center_y - box_height / 2)..(box_center_y + box_height / 2);
 
     for y in 0..(height as usize) {
-        let base = unsafe { pixels.as_slice_mut().as_mut_ptr().add(y * width as usize) };
+        let base = &mut pixels.as_slice_mut()[y * width as usize..];
 
         let v = (y as f32 / height as f32 * 255.0) as u8;
         for x in 0..(width as usize) {
-            let [r, g, b] = unsafe { base.add(x).as_mut_unchecked() };
+            let [r, g, b] = &mut base[x];
             let u = (x as f32 / width as f32 * 255.0) as u8;
             *r = (u as f32 * t) as u8;
             *g = (v as f32 * t) as u8;
@@ -65,7 +65,7 @@ fn main() -> std::io::Result<()> {
 
     let mut encoder = PxFrameEncoder::new(1920, 1080);
     for y in 0..1080 {
-        unsafe { encoder.update_row(y as u16, &[[0; 3]; 1920]) };
+        encoder.update_row(y as u16, &[[0; 3]; 1920]);
     }
     tcp.write_all(encoder.encoded()).unwrap();
     drop(encoder);
@@ -88,7 +88,7 @@ fn main() -> std::io::Result<()> {
             let t_secs = start.elapsed().as_secs_f32();
             render(pixels, t_secs);
             for (y, row) in pixels.as_slice().chunks_exact(width as usize).enumerate() {
-                unsafe { encoder.update_row(y as u16, row) };
+                encoder.update_row(y as u16, row);
             }
         },
         |(_, encoder)| {
@@ -172,11 +172,9 @@ pub struct Pixels {
 
 impl Pixels {
     pub fn new(width: u16, height: u16) -> Self {
-        let pixels_uninit = Box::new_zeroed_slice(width as usize * height as usize);
+        let pixels_uninit = Box::new_uninit_slice(width as usize * height as usize);
         Self {
-            // SAFETY Pixels always have a valid state.
-            //        The only way to access them is through render,
-            //        which overrides all of them.
+            // SAFETY Pixels always have a valid state no matter the underlying bytes.
             pixels: unsafe { pixels_uninit.assume_init() },
             width,
             height,
