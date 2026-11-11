@@ -30,7 +30,7 @@ impl PxFrameEncoder {
 
                 // Skip rgb hex section
                 offsets.push(cache.len());
-                cache.extend_from_slice(b"ffffff");
+                cache.extend_from_slice(b"000000");
 
                 cache.push(b'\n');
             }

@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::io::Write;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
@@ -15,8 +15,8 @@ use encode::PxFrameEncoder;
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
-const WIDTH: usize = 1280;
-const HEIGHT: usize = 720;
+const WIDTH: usize = 960;
+const HEIGHT: usize = 480;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
@@ -62,7 +62,6 @@ fn render(pixels: &mut Pixels, t_secs: f32) {
 fn main() -> std::io::Result<()> {
     let mut tcp: TcpStream = TcpStream::connect(&*ADDR).unwrap();
     tcp.set_nodelay(true).unwrap();
-    tcp.set_nonblocking(false).unwrap();
 
     let mut encoder = PxFrameEncoder::new(1920, 1080);
     for y in 0..1080 {
@@ -72,7 +71,7 @@ fn main() -> std::io::Result<()> {
     drop(encoder);
 
     let (width, height) = (WIDTH as u16, HEIGHT as u16);
-    let swapchain: Arc<SwapChain<(Pixels, PxFrameEncoder)>> = Arc::new(SwapChain::new(
+    let swapchain = SwapChain::new(
         (
             Pixels::new(width, height),
             PxFrameEncoder::new(width, height),
@@ -81,87 +80,87 @@ fn main() -> std::io::Result<()> {
             Pixels::new(width, height),
             PxFrameEncoder::new(width, height),
         ),
-    ));
-    let barrier = Arc::new(Barrier::new(2));
+    );
     let start = Instant::now();
 
-    std::thread::spawn({
-        let swapchain = swapchain.clone();
-        let barrier = barrier.clone();
-        move || {
-            loop {
-                let measure_start = Instant::now();
-
-                let (pixels, encoder) = unsafe { swapchain.front().as_mut_unchecked() };
-                let t_secs = start.elapsed().as_secs_f32();
-                render(pixels, t_secs);
-                for (y, row) in pixels.as_slice().chunks_exact(width as usize).enumerate() {
-                    unsafe { encoder.update_row(y as u16, row) };
-                }
-
-                let delta_t = measure_start.elapsed();
-                let fps = Duration::from_secs(1).div_duration_f32(delta_t);
-                println!("render average: {delta_t:?} per frame, {fps:?}fps");
-
-                barrier.wait();
+    swapchain.run(
+        move |(pixels, encoder)| {
+            let t_secs = start.elapsed().as_secs_f32();
+            render(pixels, t_secs);
+            for (y, row) in pixels.as_slice().chunks_exact(width as usize).enumerate() {
+                unsafe { encoder.update_row(y as u16, row) };
             }
-        }
-    });
-
-    let mut i: u32 = 0;
-    let mut measure_start = Instant::now();
-    loop {
-        barrier.wait();
-        let (_, encoder) = unsafe { swapchain.back().as_ref_unchecked() };
-        tcp.write_all(encoder.encoded()).unwrap();
-        swapchain.swap();
-
-        if measure_start.elapsed() >= Duration::from_secs(1) {
-            let delta_t = measure_start.elapsed() / i;
-            let fps = Duration::from_secs(1).div_duration_f32(delta_t);
-            println!("send average: {delta_t:?} per frame, {fps:?}fps");
-            measure_start = Instant::now();
-            i = 0;
-        }
-        i = i.wrapping_add(1);
-    }
+        },
+        |(_, encoder)| {
+            tcp.write_all(encoder.encoded()).unwrap();
+        },
+    )
 }
 
 struct SwapChain<T> {
     chain: [UnsafeCell<T>; 2],
-    swapped: AtomicBool,
 }
 
-unsafe impl<A> Sync for SwapChain<A> {}
-
-impl<T> SwapChain<T> {
+impl<T: 'static> SwapChain<T> {
     fn new(a: T, b: T) -> Self {
         Self {
             chain: [UnsafeCell::new(a), UnsafeCell::new(b)],
-            swapped: AtomicBool::new(false),
         }
     }
 
-    fn swap(&self) {
-        self.swapped.fetch_xor(true, Ordering::AcqRel);
-    }
+    fn run(
+        self,
+        mut write: impl FnMut(&mut T) -> () + std::marker::Send + 'static,
+        mut read: impl FnMut(&T) -> () + std::marker::Send,
+    ) -> ! {
+        let barrier = Arc::new(Barrier::new(2));
+        let front = Arc::new(AtomicPtr::new(self.chain[0].get()));
+        let back = self.chain[1].get();
 
-    unsafe fn front(&self) -> *mut T {
-        let i = if self.swapped.load(Ordering::Acquire) {
-            0
-        } else {
-            1
-        };
-        self.chain[i].get()
-    }
+        std::thread::spawn({
+            let barrier = barrier.clone();
+            let front = front.clone();
+            move || {
+                let mut measure_start = Instant::now();
+                loop {
+                    let render_start = Instant::now();
 
-    unsafe fn back(&self) -> *const T {
-        let i = if self.swapped.load(Ordering::Acquire) {
-            1
-        } else {
-            0
-        };
-        self.chain[i].get()
+                    let current_front = front.load(Ordering::Acquire);
+                    write(unsafe { current_front.as_mut_unchecked() });
+
+                    barrier.wait();
+
+                    if measure_start.elapsed() >= Duration::from_secs(1) {
+                        let delta_t = render_start.elapsed();
+                        let fps = Duration::from_secs(1).div_duration_f32(delta_t);
+                        println!("render: {delta_t:?} per frame, {fps:?}fps");
+                        measure_start = Instant::now();
+                    }
+
+                    barrier.wait();
+                }
+            }
+        });
+
+        let mut i: u32 = 0;
+        let mut measure_start = Instant::now();
+        loop {
+            barrier.wait();
+
+            read(unsafe { back.as_ref_unchecked() });
+            front.swap(back, Ordering::AcqRel);
+
+            if measure_start.elapsed() >= Duration::from_secs(1) {
+                let delta_t = measure_start.elapsed() / i;
+                let fps = Duration::from_secs(1).div_duration_f32(delta_t);
+                println!("send: {delta_t:?} per frame, {fps:?}fps");
+                measure_start = Instant::now();
+                i = 0;
+            }
+            i = i.wrapping_add(1);
+
+            barrier.wait();
+        }
     }
 }
 
@@ -173,7 +172,7 @@ pub struct Pixels {
 
 impl Pixels {
     pub fn new(width: u16, height: u16) -> Self {
-        let pixels_uninit = Box::new_uninit_slice(width as usize * height as usize);
+        let pixels_uninit = Box::new_zeroed_slice(width as usize * height as usize);
         Self {
             // SAFETY Pixels always have a valid state.
             //        The only way to access them is through render,
