@@ -1,6 +1,5 @@
 [build]
 rustflags = [
-    "-Cforce-frame-pointers=yes",
-    "-Ctarget-cpu=native",
-    "-Ctarget-feature=+aes,+sse2",
+    "-C", "force-frame-pointers=yes",
+    "-C", "target-cpu=native",
 ]

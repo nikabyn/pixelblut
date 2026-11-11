@@ -1,40 +1,33 @@
+use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
-use std::thread;
 use std::time::{Duration, Instant};
 
 mod render;
-use render::*;
 
 mod encode;
-use encode::{PIXEL_SIZE, PxFrameEncoder};
+use encode::PxFrameEncoder;
+
+use crate::render::FrameRenderer;
 
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
 // const WIDTH: usize = 960;
 // const HEIGHT: usize = 480;
-// const NUM_SEND_THREADS: usize = 1;
-// const NUM_GEN_THREADS: usize = 4;
 
 // Ethernet direct
 const ADDR: &str = "10.10.10.2:1234";
-const WIDTH: usize = 1920 / 2;
-const HEIGHT: usize = 1080 / 2;
-const NUM_SEND_THREADS: usize = 1;
-const NUM_GEN_THREADS: usize = 8;
+const WIDTH: usize = 1280;
+const HEIGHT: usize = 720;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
 // const WIDTH: usize = 1920;
 // const HEIGHT: usize = 1080;
-// const NUM_SEND_THREADS: usize = 8;
-// const NUM_GEN_THREADS: usize = 8;
 
 fn main() -> std::io::Result<()> {
-    static mut PIXEL_BUFFER: [u8; PIXEL_SIZE * WIDTH * HEIGHT] = [0; _];
-    let pixels = (&raw mut PIXEL_BUFFER).cast::<[u8; 3]>();
-
     let mut clear = PixelflutStream::new(ADDR, 0, 0, 1920, 1080);
     for y in 0..1080 {
         clear.write_rgb_row(y as u16, &[[0; 3]; 1920]);
@@ -42,109 +35,136 @@ fn main() -> std::io::Result<()> {
     clear.flush().unwrap();
     drop(clear);
 
-    let aspect_ratio = WIDTH as f64 / HEIGHT as f64;
-
-    let chunks_x = ((NUM_SEND_THREADS as f64 * aspect_ratio).sqrt()).round() as usize;
-    let chunks_y = NUM_SEND_THREADS.div_ceil(chunks_x);
-
-    let send_barrier: Arc<Barrier> = Arc::new(Barrier::new(0));
-    for chunk in chunks(pixels, chunks_x, chunks_y) {
-        let send_barrier = send_barrier.clone();
-        thread::spawn(|| {
-            send_pixels_worker(chunk, send_barrier);
-        });
-    }
-
-    run_render_loop(pixels, WIDTH, HEIGHT);
+    PixelflutClient::new(ADDR, WIDTH as u16, HEIGHT as u16).run()
 }
 
-fn send_pixels_worker(mut chunk: Chunk, barrier: Arc<Barrier>) {
-    // eprintln!("worker {} connected", chunk.index);
-
-    let min_x: u16 = chunk.offset_x as u16;
-    let min_y: u16 = chunk.offset_y as u16;
-    let max_x: u16 = min_x + chunk.width as u16;
-    let max_y: u16 = min_y + chunk.height as u16;
-
-    let mut stream = PixelflutStream::new(ADDR, min_x, min_y, max_x - min_x, max_y - min_y);
-
-    let mut start = Instant::now();
-    let mut i = 0;
-    loop {
-        barrier.wait();
-
-        for (y, row) in chunk.rows().enumerate() {
-            stream.write_rgb_row(y as u16, row);
-        }
-        stream.flush().unwrap();
-
-        if start.elapsed() > Duration::from_millis(1000) {
-            let delta_t = start.elapsed() / (i + 1);
-            let send_fps = Duration::from_secs(1).as_nanos() / delta_t.as_nanos();
-            eprintln!("send time = {delta_t:?}");
-            eprintln!("send fps = {send_fps:?}");
-            i = 0;
-            start = Instant::now();
-        }
-        i += 1;
-    }
+struct PixelflutClient {
+    swapchain: SwapChain<(FrameRenderer, PxFrameEncoder)>,
+    addr: Box<str>,
+    width: u16,
+    height: u16,
 }
 
-fn chunks(pixels: *mut [u8; 3], chunks_x: usize, chunks_y: usize) -> impl Iterator<Item = Chunk> {
-    (0..chunks_x)
-        .flat_map(move |x| (0..chunks_y).map(move |y| (x, y)))
-        .map(move |(index_x, index_y)| {
-            let offset_x = index_x * WIDTH / chunks_x;
-            let offset_y = index_y * HEIGHT / chunks_y;
+impl PixelflutClient {
+    fn new(addr: &str, width: u16, height: u16) -> Self {
+        Self {
+            swapchain: SwapChain::new(
+                (
+                    FrameRenderer::new(width, height),
+                    PxFrameEncoder::new(width, height),
+                ),
+                (
+                    FrameRenderer::new(width, height),
+                    PxFrameEncoder::new(width, height),
+                ),
+            ),
+            addr: Box::from(addr),
+            width,
+            height,
+        }
+    }
 
-            let end_x = (index_x + 1) * WIDTH / chunks_x;
-            let end_y = (index_y + 1) * HEIGHT / chunks_y;
+    fn run(self) -> ! {
+        let Self {
+            swapchain,
+            addr,
+            width,
+            ..
+        } = self;
+        let swapchain = Arc::new(swapchain);
+        let barrier = Arc::new(Barrier::new(2));
+        let start = Instant::now();
 
-            let width = end_x - offset_x;
-            let height = end_y - offset_y;
+        std::thread::spawn({
+            let swapchain = swapchain.clone();
+            let barrier = barrier.clone();
+            move || {
+                loop {
+                    let measure_start = Instant::now();
 
-            let offset = offset_y * WIDTH + offset_x;
+                    let (renderer, encoder) = unsafe { swapchain.front().as_mut_unchecked() };
+                    let t = start.elapsed().as_secs_f32();
+                    let pixels = renderer.render(t);
+                    for (y, row) in pixels.chunks_exact(width as usize).enumerate() {
+                        unsafe { encoder.update_row(y as u16, row) };
+                    }
 
-            Chunk {
-                pixels: unsafe { pixels.add(offset) },
-                offset_x,
-                offset_y,
-                width,
-                height,
+                    let delta_t = measure_start.elapsed();
+                    let fps = Duration::from_secs(1).div_duration_f32(delta_t);
+                    // println!("render average: {delta_t:?} per frame, {fps:?}fps");
+
+                    barrier.wait();
+                }
             }
-        })
-}
+        });
 
-struct Chunk {
-    pixels: *mut [u8; 3],
-    offset_x: usize,
-    offset_y: usize,
-    width: usize,
-    height: usize,
-}
+        let mut tcp = TcpStream::connect(&*addr).unwrap();
+        tcp.set_nodelay(true).unwrap();
+        tcp.set_nonblocking(false).unwrap();
 
-impl Chunk {
-    fn rows(&mut self) -> impl Iterator<Item = &mut [[u8; 3]]> + '_ {
-        let pixels = self.pixels;
-        let width = self.width;
-        let height = self.height;
+        let mut i: u32 = 0;
+        let mut measure_start = Instant::now();
+        loop {
+            barrier.wait();
+            let (_, encoder) = unsafe { swapchain.back().as_ref_unchecked() };
+            tcp.write_all(encoder.encoded()).unwrap();
+            swapchain.swap();
 
-        (0..height)
-            .map(move |y| unsafe { std::slice::from_raw_parts_mut(pixels.add(y * WIDTH), width) })
+            if measure_start.elapsed() >= Duration::from_secs(1) {
+                let delta_t = measure_start.elapsed() / i;
+                let fps = Duration::from_secs(1).div_duration_f32(delta_t);
+                println!("send average: {delta_t:?} per frame, {fps:?}fps");
+                measure_start = Instant::now();
+                i = 0;
+            }
+            i = i.wrapping_add(1);
+        }
     }
 }
 
-// Each chunk owns a distinct rectangular region.
-// Mutable slices are only created for individual rows.
-unsafe impl Send for Chunk {}
+struct SwapChain<T> {
+    chain: [UnsafeCell<T>; 2],
+    swapped: AtomicBool,
+}
+
+unsafe impl<A> Sync for SwapChain<A> {}
+
+impl<T> SwapChain<T> {
+    fn new(a: T, b: T) -> Self {
+        Self {
+            chain: [UnsafeCell::new(a), UnsafeCell::new(b)],
+            swapped: AtomicBool::new(false),
+        }
+    }
+
+    fn swap(&self) {
+        self.swapped.fetch_xor(true, Ordering::AcqRel);
+    }
+
+    unsafe fn front(&self) -> *mut T {
+        let i = if self.swapped.load(Ordering::Acquire) {
+            0
+        } else {
+            1
+        };
+        self.chain[i].get()
+    }
+
+    unsafe fn back(&self) -> *const T {
+        let i = if self.swapped.load(Ordering::Acquire) {
+            1
+        } else {
+            0
+        };
+        self.chain[i].get()
+    }
+}
 
 struct PixelflutStream {
     inner: TcpStream,
     encoder: PxFrameEncoder,
     offset_x: u16,
     offset_y: u16,
-    width: u16,
-    height: u16,
 }
 
 impl PixelflutStream {
@@ -158,18 +178,9 @@ impl PixelflutStream {
             encoder: PxFrameEncoder::new(width, height),
             offset_x,
             offset_y,
-            width,
-            height,
         };
         stream.flush_offset().unwrap();
         stream
-    }
-
-    fn reconnect_tcp(&mut self) -> io::Result<()> {
-        let new_tcp = TcpStream::connect(ADDR)?;
-        new_tcp.set_nonblocking(true)?;
-        _ = std::mem::replace(&mut self.inner, new_tcp);
-        self.flush_offset()
     }
 
     fn write_rgb_row(&mut self, y: u16, row: &[[u8; 3]]) {

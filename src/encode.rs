@@ -1,5 +1,3 @@
-pub const PIXEL_SIZE: usize = 3;
-
 pub struct PxFrameEncoder {
     cache: Box<[u8]>,
     offsets: Box<[usize]>,
@@ -130,7 +128,6 @@ pub fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
 
 #[test]
 fn benchmark_encode() {
-    use crate::Chunk;
     use std::time::{Duration, Instant};
 
     const WIDTH: usize = 1920;
@@ -149,21 +146,13 @@ fn benchmark_encode() {
         }
     }
 
-    let mut chunk = Chunk {
-        pixels: pixels.as_mut_ptr(),
-        offset_x: 0,
-        offset_y: 0,
-        width: WIDTH,
-        height: HEIGHT,
-    };
-
     let mut encoder = PxFrameEncoder::new(WIDTH as u16, HEIGHT as u16);
 
     let iterations = 500;
     let mut encode_times = Vec::new();
     for _ in 0..iterations {
         let start = Instant::now();
-        for (row_y, row_data) in chunk.rows().enumerate() {
+        for (row_y, row_data) in pixels.chunks_exact_mut(WIDTH).enumerate() {
             unsafe { encoder.update_row(row_y as u16, row_data) };
         }
         encode_times.push(start.elapsed());

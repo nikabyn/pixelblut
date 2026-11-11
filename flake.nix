@@ -13,11 +13,7 @@
     };
 
     libraries = with pkgs; [
-      # wayland
-      # vulkan-loader
     ];
-
-    # wildStdenv = pkgs.useWildLinker pkgs.stdenv;
   in {
     packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
       pname = "pixelblut";
@@ -30,25 +26,20 @@
       doCheck = false;
 
       nativeBuildInputs = with pkgs; [
-        pkg-config
         makeWrapper
       ];
 
       buildInputs = libraries;
     };
 
-    devShells.${system}.default = pkgs.mkShell
-    # .override {stdenv = wildStdenv;}
-    {
+    devShells.${system}.default = pkgs.mkShell {
       nativeBuildInputs = with pkgs; [
-        rustc
         cargo
         rustfmt
         clippy
         rust-analyzer
         perf
-
-        pkg-config
+        valgrind-light
       ];
 
       buildInputs = with pkgs; [
