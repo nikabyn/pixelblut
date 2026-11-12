@@ -1,22 +1,23 @@
 use std::cell::UnsafeCell;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 mod encode;
-use encode::PxFrameEncoder;
+use encode::{Encoder, Interlacing};
 
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
 // const WIDTH: usize = 960;
-// const HEIGHT: usize = 480;
+// const HEIGHT: usize = 540;
 
 // Ethernet direct
-const ADDR: &str = "10.10.10.2:1234";
+const ADDR: &str = "6.1.0.6:1234";
 const WIDTH: usize = 960;
-const HEIGHT: usize = 480;
+const HEIGHT: usize = 540;
 
 // local
 // const ADDR: &str = "0.0.0.0:1234";
@@ -24,7 +25,7 @@ const HEIGHT: usize = 480;
 // const HEIGHT: usize = 1080;
 
 fn render(pixels: &mut Pixels, t_secs: f32) {
-    let t = (t_secs % 3.0) / 3.0;
+    let t = (t_secs % 1.0) / 1.0;
 
     let width = pixels.width();
     let height = pixels.height();
@@ -63,33 +64,29 @@ fn main() -> std::io::Result<()> {
     let mut tcp: TcpStream = TcpStream::connect(&*ADDR).unwrap();
     tcp.set_nodelay(true).unwrap();
 
-    let mut encoder = PxFrameEncoder::new(1920, 1080);
-    for y in 0..1080 {
-        encoder.update_row(y as u16, &[[0; 3]; 1920]);
-    }
+    let mut encoder = Encoder::new(1920, 1080, None);
+    encoder.update(&Pixels::new(1920, 1080, [0; 3]));
     tcp.write_all(encoder.encoded()).unwrap();
     drop(encoder);
 
     let (width, height) = (WIDTH as u16, HEIGHT as u16);
     let swapchain = SwapChain::new(
         (
-            Pixels::new(width, height),
-            PxFrameEncoder::new(width, height),
+            Pixels::new(width, height, [0; 3]),
+            Encoder::new(width, height, Some(Interlacing::Even)),
         ),
         (
-            Pixels::new(width, height),
-            PxFrameEncoder::new(width, height),
+            Pixels::new(width, height, [0; 3]),
+            Encoder::new(width, height, Some(Interlacing::Odd)),
         ),
     );
-    let start = Instant::now();
 
+    let start = Instant::now();
     swapchain.run(
         move |(pixels, encoder)| {
             let t_secs = start.elapsed().as_secs_f32();
             render(pixels, t_secs);
-            for (y, row) in pixels.as_slice().chunks_exact(width as usize).enumerate() {
-                encoder.update_row(y as u16, row);
-            }
+            encoder.update(pixels);
         },
         |(_, encoder)| {
             tcp.write_all(encoder.encoded()).unwrap();
@@ -115,7 +112,7 @@ impl<T: 'static> SwapChain<T> {
     ) -> ! {
         let barrier = Arc::new(Barrier::new(2));
         let front = Arc::new(AtomicPtr::new(self.chain[0].get()));
-        let back = self.chain[1].get();
+        let mut back = self.chain[1].get();
 
         std::thread::spawn({
             let barrier = barrier.clone();
@@ -147,8 +144,9 @@ impl<T: 'static> SwapChain<T> {
         loop {
             barrier.wait();
 
+            let completed = front.swap(back, Ordering::AcqRel);
+            back = completed;
             read(unsafe { back.as_ref_unchecked() });
-            front.swap(back, Ordering::AcqRel);
 
             if measure_start.elapsed() >= Duration::from_secs(1) {
                 let delta_t = measure_start.elapsed() / i;
@@ -171,10 +169,11 @@ pub struct Pixels {
 }
 
 impl Pixels {
-    pub fn new(width: u16, height: u16) -> Self {
-        let pixels_uninit = Box::new_uninit_slice(width as usize * height as usize);
+    pub fn new(width: u16, height: u16, fill: [u8; 3]) -> Self {
+        let mut pixels_uninit = Box::new_uninit_slice(width as usize * height as usize);
+        pixels_uninit.fill(MaybeUninit::new(fill));
         Self {
-            // SAFETY Pixels always have a valid state no matter the underlying bytes.
+            // SAFETY Pixels have been initialized
             pixels: unsafe { pixels_uninit.assume_init() },
             width,
             height,

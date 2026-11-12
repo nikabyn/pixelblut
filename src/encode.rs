@@ -1,40 +1,37 @@
 use std::mem::transmute;
 
-pub struct PxFrameEncoder {
+use crate::Pixels;
+
+pub struct Encoder {
     cache: Box<[u8]>,
     offsets: Box<[usize]>,
     width: u16,
     height: u16,
+    interlacing: Option<Interlacing>,
 }
 
-impl PxFrameEncoder {
-    pub fn new(width: u16, height: u16) -> Self {
-        let mut cache = Vec::with_capacity(
-            width as usize * height as usize * size_of_val(b"PX xxxxx yyyyy ffffff\n"),
-        );
-        let mut offsets = Vec::with_capacity(width as usize * height as usize);
+impl Encoder {
+    pub fn new(width: u16, height: u16, interlacing: Option<Interlacing>) -> Self {
+        let elements = if interlacing.is_some() {
+            (width as usize * height as usize) / 2
+        } else {
+            width as usize * height as usize
+        };
+        let mut cache = Vec::with_capacity(elements * size_of_val(b"PX xxxxx yyyyy ffffff\n"));
+        let mut offsets = Vec::with_capacity(elements);
 
         for y in 0..height {
             for x in 0..width {
-                cache.extend_from_slice(b"PX ");
-
-                let mut x_buffer = [0; 5];
-                let x_len = encode_u16(x, &mut x_buffer);
-                cache.extend_from_slice(&x_buffer[5 - x_len..]);
-
-                cache.push(b' ');
-
-                let mut y_buffer = [0; 5];
-                let y_len = encode_u16(y, &mut y_buffer);
-                cache.extend_from_slice(&y_buffer[5 - y_len..]);
-
-                cache.push(b' ');
+                if let Some(interlacing) = interlacing
+                    && ((x ^ y) & 1) == interlacing as u16
+                {
+                    continue;
+                }
+                cache.extend_from_slice(format!("PX {x} {y} ").as_bytes());
 
                 // Skip rgb hex section
                 offsets.push(cache.len());
-                cache.extend_from_slice(b"000000");
-
-                cache.push(b'\n');
+                cache.extend_from_slice(b"ff00ff\n");
             }
         }
 
@@ -45,11 +42,12 @@ impl PxFrameEncoder {
             offsets: offsets.into_boxed_slice(),
             width,
             height,
+            interlacing,
         }
     }
 
-    pub fn update_row(&mut self, row_y: u16, row_data: &[[u8; 3]]) {
-        assert!(row_y < self.height && row_data.len() == self.width as usize);
+    pub fn update(&mut self, pixels: &Pixels) {
+        assert!(pixels.width == self.width && pixels.height() == self.height);
 
         static HEX_U8: [u16; 256] = {
             let mut table = [0; 256];
@@ -64,27 +62,36 @@ impl PxFrameEncoder {
             table
         };
 
-        let start_key = pixel_key(0, row_y, self.width);
+        let mut cache_index = 0;
+        for (i, [r, g, b]) in pixels.as_slice().iter().enumerate() {
+            let x = i % self.width as usize;
+            let y = i / self.width as usize;
 
-        let mut offset = self.offsets[start_key];
-        let mut stride = size_of_val(b"PX   ffffff\n").wrapping_add(digits_u16(row_y));
+            if let Some(interlacing) = self.interlacing
+                && ((x ^ y) & 1) == interlacing as usize
+            {
+                continue;
+            }
 
-        for (x, [r, g, b]) in row_data.iter().enumerate() {
-            let inc_stride = x == 0 || x == 9 || x == 99 || x == 999 || x == 9999;
-            stride = stride.wrapping_add(1 * inc_stride as usize);
+            let offset = self.offsets[cache_index];
+            cache_index += 1;
 
             let dst: &mut [u16] = unsafe { transmute(&mut self.cache[offset..]) };
             dst[0] = HEX_U8[*r as usize];
             dst[1] = HEX_U8[*g as usize];
             dst[2] = HEX_U8[*b as usize];
-
-            offset = offset.wrapping_add(stride);
         }
     }
 
     pub fn encoded(&self) -> &[u8] {
         &self.cache
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum Interlacing {
+    Even = 0,
+    Odd = 1,
 }
 
 pub fn encode_u16(value: u16, buffer: &mut [u8; 5]) -> usize {
@@ -107,10 +114,6 @@ pub fn digits_u16(value: u16) -> usize {
     }
 }
 
-pub fn pixel_key(x: u16, y: u16, width: u16) -> usize {
-    y as usize * width as usize + x as usize
-}
-
 pub fn encode_rgb_hex(rgb: [u8; 3], buffer: &mut [u8; 6]) {
     let chars = b"0123456789abcdef";
 
@@ -129,9 +132,9 @@ fn benchmark_encode() {
 
     const WIDTH: usize = 1920;
     const HEIGHT: usize = 1080;
-    let mut pixels = Box::new([[0; 3]; WIDTH * HEIGHT]);
+    let mut pixels = Pixels::new(WIDTH as u16, HEIGHT as u16, [0; 3]);
 
-    for (i, rgb) in pixels.iter_mut().enumerate() {
+    for (i, rgb) in pixels.as_slice_mut().iter_mut().enumerate() {
         for byte in rgb {
             *byte = match i {
                 0..12 => 0x0f,
@@ -143,18 +146,16 @@ fn benchmark_encode() {
         }
     }
 
-    let mut encoder = PxFrameEncoder::new(WIDTH as u16, HEIGHT as u16);
+    let mut encoder = Encoder::new(WIDTH as u16, HEIGHT as u16, None);
 
     let iterations = 500;
     let mut encode_times = Vec::new();
     for _ in 0..iterations {
         let start = Instant::now();
-        for (row_y, row_data) in pixels.chunks_exact_mut(WIDTH).enumerate() {
-            encoder.update_row(row_y as u16, row_data);
-        }
+        encoder.update(&pixels);
         encode_times.push(start.elapsed());
 
-        for (i, rgb) in pixels.iter_mut().enumerate() {
+        for (i, rgb) in pixels.as_slice_mut().iter_mut().enumerate() {
             for byte in rgb {
                 *byte = match i {
                     0..100 => 255 - *byte,
