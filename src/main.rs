@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 mod encode;
-use encode::{Encoder, Interlacing};
+use encode::{BasicTextEncoder, InterlacedTextEncoder, TextEncoder};
 
 // Wifi
 // const ADDR: &str = "10.42.0.1:1234";
@@ -15,7 +15,7 @@ use encode::{Encoder, Interlacing};
 // const HEIGHT: usize = 540;
 
 // Ethernet direct
-const ADDR: &str = "6.1.0.6:1234";
+const ADDR: &str = "10.10.10.2:1234";
 const WIDTH: usize = 960;
 const HEIGHT: usize = 540;
 
@@ -64,20 +64,20 @@ fn main() -> std::io::Result<()> {
     let mut tcp: TcpStream = TcpStream::connect(&*ADDR).unwrap();
     tcp.set_nodelay(true).unwrap();
 
-    let mut encoder = Encoder::new(1920, 1080, None);
-    encoder.update(&Pixels::new(1920, 1080, [0; 3]));
-    tcp.write_all(encoder.encoded()).unwrap();
+    let mut encoder = BasicTextEncoder::new(1920, 1080);
+    let encoded = encoder.encode(&Pixels::new(1920, 1080, [0; 3]));
+    tcp.write_all(encoded).unwrap();
     drop(encoder);
 
     let (width, height) = (WIDTH as u16, HEIGHT as u16);
     let swapchain = SwapChain::new(
         (
             Pixels::new(width, height, [0; 3]),
-            Encoder::new(width, height, Some(Interlacing::Even)),
+            InterlacedTextEncoder::new(width, height, 0),
         ),
         (
             Pixels::new(width, height, [0; 3]),
-            Encoder::new(width, height, Some(Interlacing::Odd)),
+            InterlacedTextEncoder::new(width, height, 1),
         ),
     );
 
@@ -86,10 +86,10 @@ fn main() -> std::io::Result<()> {
         move |(pixels, encoder)| {
             let t_secs = start.elapsed().as_secs_f32();
             render(pixels, t_secs);
-            encoder.update(pixels);
+            encoder.encode(pixels);
         },
         |(_, encoder)| {
-            tcp.write_all(encoder.encoded()).unwrap();
+            tcp.write_all(encoder.cache()).unwrap();
         },
     )
 }
